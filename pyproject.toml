@@ -1,0 +1,29 @@
+[project]
+name = "pumpbot"
+version = "0.1.0"
+description = "pump.fun new-mint sniper bot (v1, instrumentation-scale)"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    "solders>=0.28,<0.30",
+    "solana>=0.40",
+    "websockets>=13",
+    "httpx>=0.27",
+    "pydantic-settings>=2.4",
+    "pyyaml>=6.0",
+    "base58>=2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+pumpbot = "pumpbot.main:run"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"

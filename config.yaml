@@ -1,0 +1,80 @@
+# All tunables live here. Nothing load-bearing should be hardcoded in pumpbot/.
+
+wallet:
+  # Preflight refuses to start outside this range.
+  # Floor = position + ata_rent + 4x priority-fee ceiling (a round trip + a retry + the close).
+  min_balance_sol: 0.0080
+  max_balance_sol: 0.05
+
+trading:
+  position_sol: 0.001
+  max_concurrent_positions: 1
+  # v2 tier-2 filters, governance limits, notifications, PumpSwap/Jupiter exit routing,
+  # and credit-meter degradation tiers unlock once the wallet is funded above this.
+  v2_features_unlock_balance_sol: 0.1
+
+fees:
+  # est_roundtrip_cost / position_sol threshold. Fractional ceiling.
+  max_fee_fraction: 0.25
+  # Absolute ceiling in SOL, independent of the fraction above — at this wallet size a
+  # percentage alone permits fees that are large relative to the whole wallet.
+  max_fee_absolute_sol: 0.0015
+  priority_fee_ceiling_sol: 0.0008
+  # Reserved per open position so a pending ATA close is never left unpayable.
+  close_fee_reserve_sol: 0.0003
+
+exits:
+  take_profit_1_multiple: 1.5
+  take_profit_1_fraction: 0.5
+  take_profit_2_multiple: 2.5
+  stop_loss_fraction: -0.35
+  timeout_seconds: 300
+
+filters:
+  tier1:
+    max_creator_supply_fraction: 0.10
+    max_mints_per_second: 5
+    curve_completion_guard_fraction: 0.80
+  creator_blocklist_path: data/creator_blocklist.json
+  name_symbol_blocklist_path: data/name_blocklist.txt
+
+rpc:
+  rps_limit: 12
+  # Rough per-method credit costs; correct against the real QuickNode dashboard after
+  # the first live hour (see README).
+  credit_costs:
+    getAccountInfo: 1
+    getMultipleAccounts: 1
+    getSignatureStatuses: 1
+    getLatestBlockhash: 1
+    sendTransaction: 1
+    simulateTransaction: 1
+    getBalance: 1
+    getTokenAccountBalance: 1
+  daily_credit_halt: 9000000
+  max_retries: 5
+  backoff_base_seconds: 0.5
+
+reconciliation:
+  interval_seconds: 60
+
+heartbeat:
+  interval_seconds: 300
+  # Zero executed trades across this many consecutive heartbeats while candidates
+  # were arriving is an idle alarm, not a quiet period.
+  idle_alarm_heartbeats: 6
+
+execution:
+  skip_preflight: true
+  confirm_poll_interval_seconds: 1.0
+  confirm_timeout_seconds: 45
+  ata_close_max_retries: 10
+  jito_bundle_enabled: false
+
+failsafe:
+  # Consecutive execution failures before dropping to exit-only mode (new entries
+  # halted, exits and reconciliation stay funded).
+  consecutive_failure_limit: 3
+
+probe:
+  default_hours: 1
