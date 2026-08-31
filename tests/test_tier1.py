@@ -51,6 +51,21 @@ def test_clean_candidate_passes():
     assert result.reason is None
 
 
+def test_mayhem_mode_rejected():
+    # Confirmed root cause of the intermittent fee_recipient NotAuthorized
+    # failures -- see Candidate.is_mayhem_mode's docstring.
+    candidate = make_candidate(is_mayhem_mode=True)
+    result = make_filter().evaluate(candidate, recent_mint_timestamps=[], now=100.0)
+    assert not result.passed
+    assert result.reason == RejectionReason.MAYHEM_MODE_UNAUTHORIZED
+
+
+def test_non_mayhem_mode_passes():
+    candidate = make_candidate(is_mayhem_mode=False)
+    result = make_filter().evaluate(candidate, recent_mint_timestamps=[], now=100.0)
+    assert result.passed
+
+
 def test_blocked_creator_rejected():
     f = make_filter(creator_blocklist={"CreatorAddr111"})
     result = f.evaluate(make_candidate(), recent_mint_timestamps=[], now=100.0)

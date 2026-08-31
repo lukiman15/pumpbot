@@ -70,6 +70,22 @@ def test_event_to_candidate_creator_supply_fraction_is_small():
     assert candidate.creator_supply_fraction == pytest.approx(0.0000353, abs=1e-6)
     assert candidate.mint == event.mint
     assert not candidate.curve.complete
+    assert candidate.is_mayhem_mode is False
+
+
+@pytest.mark.asyncio
+async def test_handle_raw_message_rejects_mayhem_mode():
+    # Confirmed root cause of intermittent fee_recipient NotAuthorized
+    # failures -- see filters/tier1.py's Candidate docstring.
+    queue: asyncio.Queue = asyncio.Queue()
+    filt = Tier1Filter(CONFIG, set(), set())
+    listener = MintListener(filt, queue)
+
+    listener._handle_raw_message(
+        json.dumps({**LIVE_CREATE_MESSAGE, "is_mayhem_mode": True})
+    )
+
+    assert queue.qsize() == 0
 
 
 @pytest.mark.asyncio

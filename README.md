@@ -106,22 +106,39 @@ cleanly when given this value. Sell's analogous slot (account [14]) is
 this project's committed historical sell sample, not just unverified — and
 is left alone rather than guessed.
 
-## Next: fee_recipient authorization looks mint/creator-scoped, not just Reserved-vs-Normal
+## Resolved: fee_recipient authorization is gated by PumpPortal's `is_mayhem_mode` flag
 
 With slippage and `bonding_curve_v2` both fixed, live buy simulations
-against brand-new mints still intermittently fail with `NotAuthorized`
+against brand-new mints still intermittently failed with `NotAuthorized`
 (`Custom: 6000`) at pump.fun's own `fee_recipient.rs:19`. Two things were
-ruled out: it isn't which pool the address is drawn from (`pick_fee_recipient`
-now only draws from `NORMAL_FEE_RECIPIENTS`, since `RESERVED_FEE_RECIPIENTS`
-consistently failed authorization in a controlled test against one mint —
-that fix stands), and it isn't which specific Normal address is picked
-(testing all 8 Normal addresses against the same mint gives the same
-result for all 8). What actually varies is the **mint**: some brand-new
-mints reject every Normal fee recipient with `NotAuthorized`, others accept
-every one of them (and then correctly proceed to real slippage checks).
-Not yet understood — plausibly creator- or mint-config-specific
-authorization pump.fun applies before this project's wallet is
-"authorized" to buy at all. Not guessed further this pass; next step is
-probably decoding the `global` config account or the mint's own bonding
-curve account for a field that predicts this, rather than continuing to
-sample blind.
+ruled out first: it isn't which pool the address is drawn from
+(`pick_fee_recipient` now only draws from `NORMAL_FEE_RECIPIENTS`, since
+`RESERVED_FEE_RECIPIENTS` consistently failed authorization — that fix
+stands), and it isn't which specific Normal address is picked (all 8 give
+the same result against a given mint).
+
+An initial 8-mint batch script aimed at finding the real cause produced
+100% spurious `IncorrectProgramId` errors — traced to a connection-reuse bug
+(rapid back-to-back differently-shaped RPC calls on one shared connection),
+*not* a real pump.fun/pumpbot issue, and that batch's data was discarded.
+
+A corrected, paced re-run (delay between every RPC call, fresh `RpcClient`
+per mint, and capturing PumpPortal's full create-message payload alongside
+each result) against 6 fresh live mints found a clean predictor:
+PumpPortal's `is_mayhem_mode` flag. Both `is_mayhem_mode: false` mints
+passed fee_recipient authorization cleanly (one then hit an unrelated
+`Custom 6063` further downstream); all three `is_mayhem_mode: true` mints
+failed with the exact `NotAuthorized` (`Custom 6000`) error at
+`fee_recipient.rs:19`. 6/6 consistent. This is a *different* correlation
+than the one already ruled out for token-program selection (see
+`program.py`'s "Token-2022 finding" — that check found `is_mayhem_mode`
+does NOT predict which token program a mint uses; this is a separate
+question it does predict).
+
+Mayhem-mode mints evidently require a different, gated fee_recipient this
+project's plain wallet isn't authorized for. Rather than guess at what that
+fee_recipient might be, `filters/tier1.py`'s `Tier1Filter` now rejects
+`is_mayhem_mode=true` candidates outright (`RejectionReason.
+MAYHEM_MODE_UNAUTHORIZED`) before they ever reach a buy simulation — see
+`Candidate.is_mayhem_mode`'s docstring. Wired through `listener.py`'s
+`NewMintEvent`/`event_to_candidate`.

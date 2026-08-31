@@ -98,8 +98,14 @@ to omit entirely; do not add it.
 Token-2022 finding: every sampled mint's owner was Token-2022
 (TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb), not legacy SPL Token,
 regardless of PumpPortal's `is_mayhem_mode` flag (that correlation was
-checked and is false). Resolve token_program per-mint via getAccountInfo on
-the mint -- never assume either program.
+checked and is false -- for TOKEN PROGRAM specifically). Resolve
+token_program per-mint via getAccountInfo on the mint -- never assume either
+program.
+
+`is_mayhem_mode` DOES predict something else entirely: fee_recipient
+authorization (see the NotAuthorized note below `pick_fee_recipient` and
+filters/tier1.py's Candidate.is_mayhem_mode). Don't conflate the two checks
+-- one ruled it out, the other confirmed it, for different questions.
 
 SELL is NOT symmetric with buy -- this was an assumption in an earlier pass
 and it was WRONG. Confirmed by sampling 13 live mainnet `sell` transactions
@@ -381,11 +387,12 @@ def verify() -> None:
     print("token_program are swapped, and sell has no volume-accumulator")
     print("accounts at all (16 vs 18).")
     print()
-    print("Separate open issue, NOT an account-ordering problem: pump.fun's own")
-    print("Buy logic sometimes rejects fee_recipient with NotAuthorized (Custom")
-    print("6000), consistently for ALL addresses in NORMAL_FEE_RECIPIENTS on")
-    print("some brand-new mints and none on others -- looks mint/creator-scoped,")
-    print("not fee-recipient-scoped. Not yet understood; see README.md.")
+    print("RESOLVED, not an account-ordering problem: pump.fun's Buy logic")
+    print("rejects fee_recipient with NotAuthorized (Custom 6000) for ALL")
+    print("addresses in NORMAL_FEE_RECIPIENTS specifically on PumpPortal")
+    print("is_mayhem_mode=true mints -- confirmed 6/6 in a paced live")
+    print("simulateTransaction test. Tier1Filter now rejects mayhem-mode mints")
+    print("outright (filters/tier1.py). See README.md.")
 
 
 if __name__ == "__main__":

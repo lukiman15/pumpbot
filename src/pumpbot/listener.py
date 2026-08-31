@@ -13,8 +13,11 @@ PumpPortal's create message (verified against 2 live samples, see git log):
       "vTokensInBondingCurve": 1072964676.107292,
       "vSolInBondingCurve": 30.00098765299999,
       "marketCapSol": 27.96..., "name": "...", "symbol": "...",
-      "uri": "...", "pool": "pump"
+      "uri": "...", "pool": "pump", "is_mayhem_mode": false
     }
+"is_mayhem_mode" is rejected outright in Tier1Filter -- confirmed root cause
+of the intermittent fee_recipient NotAuthorized failures (see
+filters/tier1.py's Candidate docstring), not just correlated.
 No official schema is published for this -- if PumpPortal changes field
 names or types, parse_create_message returns None (see the .get() defaults
 below) rather than raising, and the mint is silently skipped.
@@ -53,6 +56,7 @@ class NewMintEvent:
     virtual_sol_in_curve: float
     virtual_tokens_in_curve: float
     notified_at: float
+    is_mayhem_mode: bool
 
 
 def parse_create_message(msg: dict, notified_at: float) -> NewMintEvent | None:
@@ -71,6 +75,7 @@ def parse_create_message(msg: dict, notified_at: float) -> NewMintEvent | None:
         virtual_sol_in_curve=msg.get("vSolInBondingCurve", 30.0),
         virtual_tokens_in_curve=msg.get("vTokensInBondingCurve", 1_073_000_000.0),
         notified_at=notified_at,
+        is_mayhem_mode=bool(msg.get("is_mayhem_mode", False)),
     )
 
 
@@ -87,6 +92,7 @@ def event_to_candidate(event: NewMintEvent) -> Candidate:
         symbol=event.symbol,
         creator_supply_fraction=creator_supply_fraction,
         curve=curve,
+        is_mayhem_mode=event.is_mayhem_mode,
     )
 
 

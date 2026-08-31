@@ -25,6 +25,7 @@ class RejectionReason(str, Enum):
     CREATOR_SUPPLY_TOO_HIGH = "creator_supply_too_high"
     CURVE_TOO_COMPLETE = "curve_too_complete"
     MINT_RATE_TOO_HIGH = "mint_rate_too_high"
+    MAYHEM_MODE_UNAUTHORIZED = "mayhem_mode_unauthorized"
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,15 @@ class Candidate:
     symbol: str
     creator_supply_fraction: float  # creator's held fraction of total supply, 0..1
     curve: BondingCurveState
+    # PumpPortal's "mayhem mode" launch flag. Confirmed root cause of the
+    # intermittent fee_recipient NotAuthorized (Custom 6000) failures: a
+    # paced, 6-mint live simulateTransaction test (not the earlier invalidated
+    # rapid-fire batch) found this predicts authorization outcome 6/6 --
+    # every is_mayhem_mode=True mint rejected ALL of NORMAL_FEE_RECIPIENTS,
+    # every is_mayhem_mode=False mint accepted them. Mayhem-mode mints
+    # evidently require a different, gated fee_recipient this project's
+    # plain wallet doesn't have -- see filters/tier1.py's evaluate().
+    is_mayhem_mode: bool = False
 
 
 def load_creator_blocklist(path: str | Path) -> set[str]:
@@ -81,6 +91,9 @@ class Tier1Filter:
         recent_mint_timestamps: Sequence[float],
         now: float,
     ) -> FilterResult:
+        if candidate.is_mayhem_mode:
+            return FilterResult(False, RejectionReason.MAYHEM_MODE_UNAUTHORIZED)
+
         if candidate.creator in self._creator_blocklist:
             return FilterResult(False, RejectionReason.CREATOR_BLOCKED)
 
