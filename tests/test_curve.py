@@ -8,6 +8,7 @@ from pumpbot.curve import (
     CurveCompleteError,
     curve_completion_fraction,
     decode_bonding_curve,
+    from_virtual_reserves,
     price_impact_fraction,
     sol_to_tokens,
     spot_price_sol_per_token,
@@ -105,3 +106,26 @@ def test_decode_bonding_curve_round_trip():
 def test_decode_bonding_curve_too_short_raises():
     with pytest.raises(ValueError):
         decode_bonding_curve(b"\x00" * 10)
+
+
+def test_from_virtual_reserves_fresh_mint_matches_known_defaults():
+    # A brand-new mint with no dev buy: virtual reserves are exactly the
+    # documented initial defaults.
+    curve = from_virtual_reserves(virtual_sol=30.0, virtual_tokens=1_073_000_000.0)
+    assert curve.virtual_sol_reserves == 30_000_000_000
+    assert curve.virtual_token_reserves == 1_073_000_000_000_000
+    assert curve.real_sol_reserves == 0
+    assert curve.real_token_reserves == 793_100_000_000_000
+    assert not curve.complete
+
+
+def test_from_virtual_reserves_live_sample_with_dev_buy():
+    # Captured live from PumpPortal: a create with a small creator dev buy.
+    curve = from_virtual_reserves(
+        virtual_sol=30.00098765299999, virtual_tokens=1072964676.107292
+    )
+    # SOL raised so far should be ~0.001 SOL (solAmount from the same sample).
+    assert curve.real_sol_reserves == pytest.approx(987653, abs=10)
+    # Real token reserves should have dropped by the same raw amount sold.
+    assert curve.real_token_reserves < 793_100_000_000_000
+    assert curve.token_total_supply == 1_000_000_000_000_000

@@ -22,6 +22,19 @@ BPS_DENOMINATOR = 10_000
 # Curve migrates to PumpSwap once real SOL reserves cross this. VERIFY before trusting.
 MIGRATION_SOL_LAMPORTS = 85_000_000_000  # 85 SOL
 
+# pump.fun's curve starts with more *virtual* reserves than *real* ones -- the
+# gap is what keeps the constant-product curve correctly shaped from token 0.
+# PumpPortal's websocket feed only reports virtual reserves (in human units:
+# SOL, whole tokens), never the real ones, so real_sol/real_token_reserves
+# have to be derived from these fixed offsets rather than read off the wire.
+# All four VERIFY before trusting for real money.
+LAMPORTS_PER_SOL = 1_000_000_000
+TOKEN_DECIMALS = 6
+INITIAL_VIRTUAL_SOL = 30.0  # SOL
+INITIAL_VIRTUAL_TOKENS = 1_073_000_000.0  # whole tokens
+INITIAL_REAL_TOKENS = 793_100_000.0  # whole tokens
+TOTAL_SUPPLY_WHOLE_TOKENS = 1_000_000_000
+
 # Anchor account discriminator (8 bytes) + 5x little-endian u64 + 1 bool byte.
 # Newer curves may have additional trailing fields (e.g. a creator pubkey);
 # those are ignored here since they don't affect this module's math.
@@ -135,3 +148,32 @@ def curve_completion_fraction(curve: BondingCurveState) -> float:
     if MIGRATION_SOL_LAMPORTS == 0:
         return 0.0
     return min(1.0, curve.real_sol_reserves / MIGRATION_SOL_LAMPORTS)
+
+
+def from_virtual_reserves(virtual_sol: float, virtual_tokens: float) -> BondingCurveState:
+    """Build a BondingCurveState from virtual reserves reported in human units
+    (SOL, whole tokens) -- e.g. PumpPortal's vSolInBondingCurve/
+    vTokensInBondingCurve fields.
+
+    real_sol_reserves and real_token_reserves are derived from pump.fun's
+    fixed initial offsets (INITIAL_VIRTUAL_SOL, INITIAL_VIRTUAL_TOKENS,
+    INITIAL_REAL_TOKENS above), not read from the account -- an
+    approximation, not ground truth. Spot-check against a live
+    getAccountInfo fetch before trusting this for a real trade.
+    """
+    virtual_sol_reserves = round(virtual_sol * LAMPORTS_PER_SOL)
+    virtual_token_reserves = round(virtual_tokens * 10**TOKEN_DECIMALS)
+    real_sol_reserves = max(
+        0, round((virtual_sol - INITIAL_VIRTUAL_SOL) * LAMPORTS_PER_SOL)
+    )
+    real_tokens = virtual_tokens - (INITIAL_VIRTUAL_TOKENS - INITIAL_REAL_TOKENS)
+    real_token_reserves = max(0, round(real_tokens * 10**TOKEN_DECIMALS))
+    token_total_supply = TOTAL_SUPPLY_WHOLE_TOKENS * 10**TOKEN_DECIMALS
+    return BondingCurveState(
+        virtual_token_reserves=virtual_token_reserves,
+        virtual_sol_reserves=virtual_sol_reserves,
+        real_token_reserves=real_token_reserves,
+        real_sol_reserves=real_sol_reserves,
+        token_total_supply=token_total_supply,
+        complete=False,
+    )
