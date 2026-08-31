@@ -12,6 +12,13 @@ trading:
   # v2 tier-2 filters, governance limits, notifications, PumpSwap/Jupiter exit routing,
   # and credit-meter degradation tiers unlock once the wallet is funded above this.
   v2_features_unlock_balance_sol: 0.1
+  # Buffer against curve-state drift between sizing a trade and it landing (even the
+  # ~0.1s gap from a `confirmed`-commitment simulateTransaction can see a competing
+  # buy land first). Buy's max_sol_cost is padded up by this fraction; sell's
+  # min_sol_output is padded down by it. Zero buffer was tripping pump.fun's own
+  # slippage-protection error (Custom 6000/6002) on live buy simulations -- see
+  # README.md.
+  slippage_tolerance_fraction: 0.05
 
 fees:
   # est_roundtrip_cost / position_sol threshold. Fractional ceiling.

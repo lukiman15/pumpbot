@@ -21,6 +21,7 @@ class TradingConfig(BaseModel):
     position_sol: float
     max_concurrent_positions: int
     v2_features_unlock_balance_sol: float
+    slippage_tolerance_fraction: float
 
 
 class FeesConfig(BaseModel):

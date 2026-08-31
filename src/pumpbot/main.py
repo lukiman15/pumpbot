@@ -46,6 +46,7 @@ from pumpbot.curve import (
     decode_bonding_curve,
     sol_to_tokens,
     spot_price_sol_per_token,
+    tokens_to_sol,
 )
 from pumpbot.executor import (
     MintNotYetVisibleError,
@@ -65,6 +66,7 @@ from pumpbot.positions import Position, PositionManager
 from pumpbot.program import (
     TOKEN_2022_PROGRAM_ID,
     derive_bonding_curve_pda,
+    derive_bonding_curve_v2_pda,
     pick_buyback_fee_recipient,
     pick_fee_recipient,
 )
@@ -178,7 +180,7 @@ async def _simulate(rpc: RpcClient, instructions: list | object, fee_payer: Pubk
 
 def _build_buy(
     mint: Pubkey, wallet_pubkey: Pubkey, creator: Pubkey, token_program_id: Pubkey,
-    tokens_out_raw: int, position_sol_lamports: int,
+    tokens_out_raw: int, max_sol_cost_lamports: int,
 ) -> list:
     """Returns [create-ATA, buy] -- a live test found that simulating the
     bare buy instruction alone fails with AccountNotInitialized on
@@ -197,19 +199,23 @@ def _build_buy(
         token_program_id=token_program_id,
         fee_recipient=pick_fee_recipient(),
         buyback_fee_recipient=pick_buyback_fee_recipient(),
-        # Confirmed via simulateTransaction (see program.py's module
-        # docstring) that this account's identity isn't validated by the
-        # current on-chain program -- the wallet's own pubkey is as good a
-        # value as any here.
-        unresolved_account=wallet_pubkey,
+        # Resolved (see program.py's module docstring on account [16]) --
+        # an arbitrary value here was only safe for already-established
+        # mints; brand-new mints require the real bonding_curve_v2 PDA or
+        # pump.fun's own program rejects the buy with InvalidBondingCurveV2.
+        unresolved_account=derive_bonding_curve_v2_pda(mint),
         amount_tokens_raw=tokens_out_raw,
-        max_sol_cost_lamports=position_sol_lamports,
+        max_sol_cost_lamports=max_sol_cost_lamports,
     )
     return [create_ata_ix, buy_ix]
 
 
 async def _simulate_buy(
-    rpc: RpcClient, wallet_pubkey: Pubkey, candidate: Candidate, position_sol_lamports: int
+    rpc: RpcClient,
+    wallet_pubkey: Pubkey,
+    candidate: Candidate,
+    position_sol_lamports: int,
+    slippage_tolerance_fraction: float,
 ) -> tuple[bool, int, str | None, bool, str | None]:
     """Returns (would_succeed, tokens_out_raw, error_summary, is_transient,
     token_program_id_used).
@@ -225,6 +231,15 @@ async def _simulate_buy(
     by simulateTransaction before any real money could move, so there's no
     money-risk in guessing. Saves one RPC round-trip in the common case;
     falls back to resolve_token_program_id's retries if the guess fails.
+
+    tokens_out_raw is still sized off the exact position_sol_lamports
+    target (how much we intend to spend), but max_sol_cost_lamports -- the
+    on-chain ceiling the instruction actually enforces -- is padded up by
+    slippage_tolerance_fraction. A live test found zero buffer here trips
+    pump.fun's own slippage-protection error on essentially every buy,
+    since even the ~0.1s gap from a `confirmed`-commitment simulate can see
+    a competing buy move the curve first. See config.yaml's comment on
+    trading.slippage_tolerance_fraction.
     """
     mint = Pubkey.from_string(candidate.mint)
     try:
@@ -234,9 +249,10 @@ async def _simulate_buy(
     if tokens_out_raw <= 0:
         return False, 0, "zero tokens out at this size", False, None
 
+    max_sol_cost_lamports = round(position_sol_lamports * (1 + slippage_tolerance_fraction))
     creator = Pubkey.from_string(candidate.creator)
     optimistic_ix = _build_buy(
-        mint, wallet_pubkey, creator, TOKEN_2022_PROGRAM_ID, tokens_out_raw, position_sol_lamports
+        mint, wallet_pubkey, creator, TOKEN_2022_PROGRAM_ID, tokens_out_raw, max_sol_cost_lamports
     )
     optimistic_error = await _simulate(rpc, optimistic_ix, wallet_pubkey)
     if optimistic_error is None:
@@ -250,7 +266,7 @@ async def _simulate_buy(
         return False, tokens_out_raw, f"resolve_token_program_id failed: {exc}", False, None
 
     ix = _build_buy(
-        mint, wallet_pubkey, creator, token_program_id, tokens_out_raw, position_sol_lamports
+        mint, wallet_pubkey, creator, token_program_id, tokens_out_raw, max_sol_cost_lamports
     )
     error = await _simulate(rpc, ix, wallet_pubkey)
     return error is None, tokens_out_raw, error, False, str(token_program_id)
@@ -262,12 +278,18 @@ async def _simulate_sell(
     mint: Pubkey,
     creator: Pubkey,
     tokens_raw: int,
+    min_sol_output_lamports: int,
     known_token_program_id: Pubkey | None = None,
 ) -> str | None:
     """known_token_program_id skips the resolve_token_program_id round-trip
     entirely -- the token program doesn't change over a mint's lifetime, so
     if the earlier buy already confirmed it, a sell of the same mint can
     reuse it directly instead of paying the same laggy RPC lookup again.
+
+    min_sol_output_lamports is the on-chain floor the instruction actually
+    enforces -- callers should derive it from curve.tokens_to_sol() padded
+    down by config.yaml's trading.slippage_tolerance_fraction, the same way
+    _simulate_buy pads its max_sol_cost up (see that function's docstring).
 
     Inherent DRY_RUN ceiling, not a bug: since buys are only ever simulated
     here, never actually sent, the wallet never really holds the tokens a
@@ -293,12 +315,14 @@ async def _simulate_sell(
         token_program_id=token_program_id,
         fee_recipient=pick_fee_recipient(),
         buyback_fee_recipient=pick_buyback_fee_recipient(),
+        # Still unresolved for sell specifically -- unlike buy's equivalent
+        # slot (derive_bonding_curve_v2_pda), the same seed formula does
+        # NOT reproduce sell's account [14] (see program.py's module
+        # docstring). Not yet re-verified against a brand-new mint's sell
+        # the way buy's slot was, so this may not actually be safe.
         unresolved_account=wallet_pubkey,
         amount_tokens_raw=tokens_raw,
-        # Instrumentation only, not a real sell -- a real one needs a min
-        # output floor derived from config.yaml's slippage tolerance, which
-        # doesn't exist yet (see this module's docstring on scope).
-        min_sol_output_lamports=0,
+        min_sol_output_lamports=min_sol_output_lamports,
     )
     return await _simulate(rpc, ix, wallet_pubkey)
 
@@ -314,6 +338,7 @@ async def run_trader(
 ) -> None:
     position_sol = settings.config.trading.position_sol
     position_sol_lamports = int(position_sol * LAMPORTS_PER_SOL)
+    slippage_tolerance_fraction = settings.config.trading.slippage_tolerance_fraction
     failure_limit = settings.config.failsafe.consecutive_failure_limit
 
     while True:
@@ -329,7 +354,7 @@ async def run_trader(
 
         try:
             would_succeed, tokens_out_raw, error, is_transient, token_program_id = await _simulate_buy(
-                rpc, wallet_pubkey, candidate, position_sol_lamports
+                rpc, wallet_pubkey, candidate, position_sol_lamports, slippage_tolerance_fraction
             )
         except Exception:
             logger.exception("buy simulation crashed for mint=%s", candidate.mint)
@@ -378,6 +403,7 @@ async def run_position_monitor(
     state: TradingState,
 ) -> None:
     exits_cfg = settings.config.exits
+    slippage_tolerance_fraction = settings.config.trading.slippage_tolerance_fraction
     failure_limit = settings.config.failsafe.consecutive_failure_limit
 
     while True:
@@ -417,12 +443,20 @@ async def run_position_monitor(
                 error = "no creator on record for this mint (position opened before a restart?)"
             elif tokens_to_sell_raw > 0:
                 try:
+                    # Floor padded down from the curve's own current-state
+                    # estimate -- same slippage buffer _simulate_buy pads
+                    # its max cost up by, see that function's docstring.
+                    expected_sol_out_lamports = tokens_to_sol(curve, tokens_to_sell_raw)
+                    min_sol_output_lamports = round(
+                        expected_sol_out_lamports * (1 - slippage_tolerance_fraction)
+                    )
                     error = await _simulate_sell(
                         rpc,
                         wallet_pubkey,
                         mint,
                         Pubkey.from_string(creator),
                         tokens_to_sell_raw,
+                        min_sol_output_lamports,
                         known_token_program_id=(
                             Pubkey.from_string(known_token_program)
                             if known_token_program is not None

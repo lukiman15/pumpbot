@@ -19,7 +19,7 @@ REAL_USER = "ATQfqM1KjEv3hMhRX3NUaCa5V9sYgC2gk6YJKNr4R3uq"  # account [6]
 REAL_CREATOR = "3wxDfDhShrp6gG8ptXu5ZrJ5rBbw25AkDijQZWpmbTWY"
 REAL_FEE_RECIPIENT = "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"  # account [1]
 REAL_BUYBACK_FEE_RECIPIENT = "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD"  # account [17]
-REAL_UNRESOLVED_16 = "3mVgg1fJstV9utmVqPRVbn4f412HfUt5k4vSsKefYanh"  # account [16], passed through as-is
+REAL_UNRESOLVED_16 = "3mVgg1fJstV9utmVqPRVbn4f412HfUt5k4vSsKefYanh"  # account [16] -- resolved, == derive_bonding_curve_v2_pda(REAL_MINT), see test_program.py
 REAL_AMOUNT = 791311616000000
 REAL_MAX_SOL_COST = 2000000000
 REAL_DATA_HEX = "66063d1201daebea0040c797b1cf02000094357700000000"

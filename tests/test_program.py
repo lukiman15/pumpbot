@@ -14,6 +14,7 @@ from pumpbot.program import (
     TOKEN_PROGRAM_ID,
     derive_associated_token_address,
     derive_bonding_curve_pda,
+    derive_bonding_curve_v2_pda,
     derive_creator_vault_pda,
     derive_event_authority_pda,
     derive_global_pda,
@@ -119,10 +120,23 @@ def test_fee_program_and_fee_config_constants_are_distinct():
     assert FEE_PROGRAM_ID != FEE_CONFIG
 
 
-def test_pick_fee_recipient_draws_from_normal_or_reserved_pools():
-    combined = set(NORMAL_FEE_RECIPIENTS) | set(RESERVED_FEE_RECIPIENTS)
+def test_derive_bonding_curve_v2_pda_matches_confirmed_live_value():
+    # Resolves buy's account [16] -- see program.py's module docstring.
+    # Confirmed two ways: this exact match against a committed historical
+    # sample (below), and live simulateTransaction on two different
+    # brand-new mints passing pump.fun's InvalidBondingCurveV2 check.
+    mint = Pubkey.from_string("Co1vGQoFLBWuxNNNE5JomAnPfR2YyCD8GRUATVLNpump")
+    assert str(derive_bonding_curve_v2_pda(mint)) == "3mVgg1fJstV9utmVqPRVbn4f412HfUt5k4vSsKefYanh"
+
+
+def test_pick_fee_recipient_draws_from_normal_pool_only():
+    # NOT normal+reserved -- a live simulateTransaction test found every
+    # RESERVED address fails with NotAuthorized for this project's wallet
+    # (16/16 consistent split across all addresses in both pools). See
+    # pick_fee_recipient's docstring.
     for _ in range(20):
-        assert str(pick_fee_recipient()) in combined
+        assert str(pick_fee_recipient()) in set(NORMAL_FEE_RECIPIENTS)
+        assert str(pick_fee_recipient()) not in set(RESERVED_FEE_RECIPIENTS)
 
 
 def test_pick_buyback_fee_recipient_draws_from_buyback_pool_only():

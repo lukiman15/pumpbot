@@ -79,17 +79,49 @@ No RPC provider change was needed in the end; the constant-k trial was
 useful for isolating the cause (ruling out "bad node") but the actual fix
 was two lines of request parameters.
 
-## Next: slippage tolerance on buy's `max_sol_cost`
+## Resolved: slippage tolerance, and buy's mystery account [16]
 
-With the above fixed, live buy simulations now fail with pump.fun's own
-custom Anchor errors (`Custom: 6000` / `Custom: 6002`, seen at the `buy`
-instruction itself) instead of infrastructure errors. The likely cause:
-`max_sol_cost_lamports` is currently set to the position size with zero
-slippage buffer, so any price movement between sizing the trade and the
-simulated/real execution (even a few hundred milliseconds) can push the
-required cost past an exact cap. `config.yaml` has no slippage-tolerance
-setting yet — `_simulate_sell` already flagged the equivalent gap on the
-sell side (`min_sol_output_lamports=0`, a placeholder, not a real floor).
-Next step: add a configurable slippage tolerance and pad both sides
-accordingly, then confirm the exact meaning of 6000 vs 6002 against
-pump.fun's error list if a copy can be found, rather than guessing.
+`config.yaml` now has `trading.slippage_tolerance_fraction` (default 5%),
+padding buy's `max_sol_cost` up and sell's `min_sol_output` down (derived
+from `curve.tokens_to_sol()` against live curve state) instead of using an
+exact, zero-buffer target. Wired into `main.py`'s `_simulate_buy` /
+`_simulate_sell`.
+
+Fetching pump.fun's actual IDL (not just the docs site) also identified the
+Anchor error codes seen while testing this: `Custom: 6000` is
+`NotAuthorized`, `Custom: 6002` is `TooMuchSolRequired` (real slippage),
+and a live simulate surfaced a third, `Custom: 6074` /
+`InvalidBondingCurveV2` — "bonding_curve_v2 remaining account is missing or
+invalid." That error message directly named the account this project had
+been calling "unresolved account [16]" since Phase 0 and had only ever
+confirmed as *safe to submit an arbitrary value for* (via simulation
+against an already-established mint) — never actually identified. Brand
+new mints require the real value: `derive_bonding_curve_v2_pda(mint)`,
+seeds `[b"bonding-curve-v2", mint]`. Confirmed two ways — it reproduces
+this project's own committed historical buy sample's account [16] exactly
+(impossible by chance for a 32-byte PDA), and live `simulateTransaction`
+against two different brand-new mints passes `InvalidBondingCurveV2`
+cleanly when given this value. Sell's analogous slot (account [14]) is
+**not** resolved by the same formula — a real, checked mismatch against
+this project's committed historical sell sample, not just unverified — and
+is left alone rather than guessed.
+
+## Next: fee_recipient authorization looks mint/creator-scoped, not just Reserved-vs-Normal
+
+With slippage and `bonding_curve_v2` both fixed, live buy simulations
+against brand-new mints still intermittently fail with `NotAuthorized`
+(`Custom: 6000`) at pump.fun's own `fee_recipient.rs:19`. Two things were
+ruled out: it isn't which pool the address is drawn from (`pick_fee_recipient`
+now only draws from `NORMAL_FEE_RECIPIENTS`, since `RESERVED_FEE_RECIPIENTS`
+consistently failed authorization in a controlled test against one mint —
+that fix stands), and it isn't which specific Normal address is picked
+(testing all 8 Normal addresses against the same mint gives the same
+result for all 8). What actually varies is the **mint**: some brand-new
+mints reject every Normal fee recipient with `NotAuthorized`, others accept
+every one of them (and then correctly proceed to real slippage checks).
+Not yet understood — plausibly creator- or mint-config-specific
+authorization pump.fun applies before this project's wallet is
+"authorized" to buy at all. Not guessed further this pass; next step is
+probably decoding the `global` config account or the mint's own bonding
+curve account for a field that predicts this, rather than continuing to
+sample blind.

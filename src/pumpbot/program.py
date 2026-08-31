@@ -9,11 +9,12 @@ instruction data's first 8 bytes, compare against sha256("global:buy")[:8].
 For each of the 18 accounts, either match it against a known constant, or
 derive it from a hypothesis (a PDA seed, an ATA, a getAccountInfo owner
 check) and confirm the derivation reproduces the on-chain value across
-every sample -- not just once. 17 of 18 positions are confirmed this way;
-position [16] is not (see below) -- an earlier pass wrongly called it a
-duplicate of [12] from a single coincidental match, caught and corrected
-once more samples disproved it. That mistake is the reason every claim
-below says how many samples it was checked against, not just "confirmed."
+every sample -- not just once. All 18 buy positions are now confirmed this
+way, including [16] (see below) -- resolved as `bonding_curve_v2` after an
+earlier pass wrongly called it a duplicate of [12] from a single
+coincidental match, caught and corrected once more samples disproved it.
+That mistake is the reason every claim below says how many samples it was
+checked against, not just "confirmed."
 
 BUY_ACCOUNTS order (index: name -- how it was confirmed):
   0  global                      -- derive_global_pda(), exact match, all samples
@@ -49,32 +50,32 @@ BUY_ACCOUNTS order (index: name -- how it was confirmed):
                                      executable=true, owned by the BPF
                                      upgradeable loader -- a real program, not
                                      a data PDA
-  16 UNKNOWN IDENTITY, CONFIRMED INERT. NOT the same as [12]. An earlier
-      pass wrongly concluded this duplicates global_volume_accumulator
-      because they happened to coincide in the very first sample decoded;
-      sampling 4 more buys disproved that (different value per sample,
-      varying with BOTH user and mint -- same user, different mint gives a
-      different [16]). The address does not exist on-chain in any sample
-      seen, even after being referenced by multiple successful transactions
-      -- so it's never read from or written to as an initialized account.
-      No PDA/ATA hypothesis tried reproduces it (wrapped SOL or the mint
-      itself under either token program, creator+mint, literal doc-name-
-      string seeds -- the last of which crashed with "Unable to find a
-      viable program address bump seed" because the 35-byte seed string
-      exceeds Solana's 32-byte-per-seed limit).
-
-      RESOLVED (practically, not by derivation): simulateTransaction against
-      live current chain state, with this position replaced by a freshly
-      generated, completely unrelated pubkey, still runs the full buy
-      end-to-end -- fee-program GetFees CPI, TransferChecked, pump.fun's own
-      final CPI, `err: null` -- for both buy and sell. The current on-chain
-      program does not validate this account's identity. Its semantic
-      purpose (why the account list includes it at all -- most plausibly an
-      unused or not-yet-activated `associated_user_volume_accumulator`
-      slot, per buy_v2's published account list, but that's still inference)
-      remains genuinely unknown. What's no longer in question is whether an
-      arbitrary value here is safe to submit: it is, as confirmed by
-      simulation (not yet by an actual send -- see note in executor.py).
+  16 bonding_curve_v2               -- RESOLVED: seeds [b"bonding-curve-v2",
+      mint], derive_bonding_curve_v2_pda(mint). An earlier pass wrongly
+      concluded this duplicates global_volume_accumulator (single
+      coincidental match in the first sample decoded, disproved by more
+      samples), then separately confirmed only that an ARBITRARY value
+      here was safe to submit via simulateTransaction, without identifying
+      what the account actually was. That simulateTransaction test used an
+      older, already-established mint; a later test against brand-new
+      mints showed pump.fun's Buy instruction now raises its own
+      `InvalidBondingCurveV2` (Custom 6074, "bonding_curve_v2 remaining
+      account is missing or invalid") when this slot is wrong -- so it is
+      NOT universally inert, and the earlier "safe to submit anything"
+      conclusion held only for mints that predate whatever feature this
+      gates. Confirmed twice independently: (1) derive_bonding_curve_v2_pda
+      applied to this module's own committed historical buy sample
+      reproduces the exact on-chain value byte-for-byte (impossible by
+      chance for a 32-byte PDA); (2) live simulateTransaction against two
+      different brand-new mints, given the derived value, passes the
+      InvalidBondingCurveV2 check entirely and proceeds into pump.fun's
+      real Buy logic (observed failing further downstream on fee_recipient
+      authorization instead -- a different, separately-tracked problem,
+      see executor.py). NOT yet confirmed for sell: the same seed formula
+      does NOT reproduce sell's account [14] from this module's committed
+      historical sell sample (a real mismatch, not just unverified) --
+      sell's remaining-account slot is evidently something else, or seeded
+      differently, and is intentionally left unresolved rather than guessed.
   17 buyback_fee_recipient       -- CONFIRMED DISTINCT from [1]'s fee_recipient
       (they vary independently across samples, including staying different
       when [1] repeats) -- every observed value matched pump.fun's published
@@ -134,14 +135,25 @@ SELL_ACCOUNTS order (16 accounts, not 18 -- see below):
   12 fee_config                   -- shifted up from buy's [14] because sell
                                      has no volume-accumulator accounts at all
   13 fee_program                  -- shifted up from buy's [15]
-  14 UNKNOWN IDENTITY, CONFIRMED INERT -- the same kind of slot as buy's [16]
-      (not the same VALUE): across samples it's constant for a given (user,
-      mint) pair and varies when either changes, matching buy's
-      characterization exactly, and likewise never exists on-chain despite
-      being referenced by successful transactions. Same simulateTransaction
-      result as buy's [16]: substituting a freshly generated, unrelated
-      pubkey here still runs the full sell end-to-end with `err: null`. See
-      the full note under buy's [16] above -- it applies identically here.
+  14 UNKNOWN IDENTITY -- the same kind of slot as buy's [16] was before it
+      got resolved (not the same VALUE): across samples it's constant for a
+      given (user, mint) pair and varies when either changes, and likewise
+      never exists on-chain despite being referenced by successful
+      transactions. UNLIKE buy's [16], the obvious next guess --
+      derive_bonding_curve_v2_pda(mint), i.e. buy's exact resolved formula
+      -- does NOT reproduce this position's value from this module's
+      committed historical sell sample. That's a real, checked mismatch,
+      not just "unverified": sell's remaining-account slot is evidently a
+      different account, seeded differently (plausibly still bonding-curve-
+      v2-related but keyed by user as well as mint, given the observed
+      per-(user,mint) variation), or an unrelated concept entirely. Not
+      guessed further. An older simulateTransaction test (against an
+      already-established mint, not a brand-new one) found an arbitrary
+      value here still ran sell end-to-end with `err: null` -- but given
+      buy's equivalent slot turned out to matter for brand-new mints
+      specifically, that result should not be trusted the same way it once
+      was until re-tested against a brand-new mint's sell the same way
+      buy was.
   15 buyback_fee_recipient       -- confirmed against pump.fun's published
       "Buyback Fee Recipients" list (FEE_RECIPIENTS.md), same role as buy's
       [17]
@@ -193,6 +205,7 @@ RENT_SYSVAR_ID = Pubkey.from_string("SysvarRent111111111111111111111111111111111
 
 GLOBAL_SEED = b"global"
 BONDING_CURVE_SEED = b"bonding-curve"
+BONDING_CURVE_V2_SEED = b"bonding-curve-v2"
 CREATOR_VAULT_SEED = b"creator-vault"
 EVENT_AUTHORITY_SEED = b"__event_authority"
 GLOBAL_VOLUME_ACCUMULATOR_SEED = b"global_volume_accumulator"
@@ -217,6 +230,20 @@ def derive_global_pda() -> Pubkey:
 def derive_bonding_curve_pda(mint: Pubkey) -> Pubkey:
     pda, _ = Pubkey.find_program_address(
         [BONDING_CURVE_SEED, bytes(mint)], PUMP_FUN_PROGRAM_ID
+    )
+    return pda
+
+
+def derive_bonding_curve_v2_pda(mint: Pubkey) -> Pubkey:
+    """Resolves buy's previously-unidentified account [16]. Confirmed two
+    ways: reproduces this module's committed historical buy sample's
+    account [16] value exactly (a 32-byte PDA match that can't happen by
+    chance), and live simulateTransaction against two different brand-new
+    mints passes pump.fun's own InvalidBondingCurveV2 check when given
+    this value. NOT confirmed for sell's analogous slot -- see this
+    module's docstring on sell's account [14]."""
+    pda, _ = Pubkey.find_program_address(
+        [BONDING_CURVE_V2_SEED, bytes(mint)], PUMP_FUN_PROGRAM_ID
     )
     return pda
 
@@ -303,11 +330,20 @@ BUYBACK_FEE_RECIPIENTS = (
 
 
 def pick_fee_recipient() -> Pubkey:
-    """Random pick from the combined Normal+Reserved pools -- matches what
-    account [1] actually draws from in every live sample checked."""
-    return Pubkey.from_string(
-        random.choice(NORMAL_FEE_RECIPIENTS + RESERVED_FEE_RECIPIENTS)
-    )
+    """Random pick from NORMAL_FEE_RECIPIENTS only.
+
+    Real historical transactions do use RESERVED_FEE_RECIPIENTS at account
+    [1] (that's why this project's docstrings/tests document both pools as
+    "confirmed live") -- but a live simulateTransaction test found every
+    RESERVED address fails with pump.fun's own `NotAuthorized` (Custom
+    6000) for OUR wallet specifically, while every NORMAL address passes
+    authorization cleanly (tested all 8 of each, 16/16 consistent split).
+    "Reserved" evidently requires an authorization this project's plain
+    wallet doesn't have -- likely gated to specific partner integrations.
+    Do not add RESERVED_FEE_RECIPIENTS back into this picker without
+    re-verifying against live simulateTransaction first.
+    """
+    return Pubkey.from_string(random.choice(NORMAL_FEE_RECIPIENTS))
 
 
 def pick_buyback_fee_recipient() -> Pubkey:
@@ -336,13 +372,20 @@ def verify() -> None:
     print(f"buy discriminator          = {BUY_DISCRIMINATOR.hex()} (confirmed live, 6 samples)")
     print(f"sell discriminator         = {SELL_DISCRIMINATOR.hex()} (confirmed live, 13 samples)")
     print()
-    print("Confirmed: 17 of buy's 18 accounts, and 15-16 of sell's 16 (see")
-    print("module docstring). Buy's [16] and sell's [14] have unknown identity")
-    print("-- no PDA/ATA hypothesis reproduces either -- but simulateTransaction")
-    print("confirms neither is validated by the current on-chain program: an")
-    print("arbitrary substitute succeeds end-to-end for both instructions. Sell")
-    print("is NOT symmetric with buy: creator_vault/token_program are swapped,")
-    print("and sell has no volume-accumulator accounts at all (16 vs 18).")
+    print("Confirmed: all 18 of buy's accounts, including [16] -- resolved as")
+    print("bonding_curve_v2 (derive_bonding_curve_v2_pda), verified against a")
+    print("committed historical sample AND live simulateTransaction on two")
+    print("brand-new mints. 15-16 of sell's 16 accounts confirmed (see module")
+    print("docstring); sell's [14] remains unresolved -- buy's resolved formula")
+    print("does NOT reproduce it. Sell is NOT symmetric with buy: creator_vault/")
+    print("token_program are swapped, and sell has no volume-accumulator")
+    print("accounts at all (16 vs 18).")
+    print()
+    print("Separate open issue, NOT an account-ordering problem: pump.fun's own")
+    print("Buy logic sometimes rejects fee_recipient with NotAuthorized (Custom")
+    print("6000), consistently for ALL addresses in NORMAL_FEE_RECIPIENTS on")
+    print("some brand-new mints and none on others -- looks mint/creator-scoped,")
+    print("not fee-recipient-scoped. Not yet understood; see README.md.")
 
 
 if __name__ == "__main__":
