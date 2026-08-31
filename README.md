@@ -42,21 +42,54 @@ Read the printed report for:
       buy/sell decision built into a real instruction and checked with
       `simulateTransaction` (read-only, zero risk — nothing is signed or sent)
 
-## Known blocker: RPC propagation lag
+## Resolved: the "RPC propagation lag" was a missing `commitment` parameter
 
-Live dry-run testing surfaced a real infrastructure problem, not a code bug:
-on the QuickNode endpoint currently configured, a brand-new mint's account is
-routinely **not yet visible** via `getAccountInfo` at the moment PumpPortal
-notifies us of it — confirmed systematic (100% of candidates in multiple
-~30-45s live runs), not intermittent. `executor.resolve_token_program_id`
-retries a few times over ~2-3 seconds, but that isn't enough to close the
-gap, and Phase 0's own measured buy-queue rank (median 0) means a sniper
-can't afford to wait it out the way `scripts/probe.py` does (a full 20s)
-without losing all competitiveness anyway.
+Live dry-run testing first surfaced what looked like a real infrastructure
+problem: a brand-new mint's account was routinely not visible via
+`getAccountInfo` at the moment PumpPortal notified us of it — 100% of
+candidates across multiple live runs, not intermittent. The initial
+hypothesis was QuickNode-specific replica lag, so a second provider
+(constant-k's Kaldera/Nexus plan, a bare-metal Geyser/shred-fed RPC) was
+brought in to test side-by-side.
 
-This is the real remaining blocker before this bot could ever land a
-competitive buy — not the unresolved account slot (see `program.py`), which
-turned out not to matter. Options, none yet evaluated: a faster/geyser-fed
-RPC provider, a different account-visibility strategy (e.g. websocket
-`accountSubscribe`, though that's still bounded by the same node's view of
-the chain), or accepting a slower entry and re-scoping away from "sniping."
+Racing both providers on real new mints showed near-identical ~10s lag on
+*both* — QuickNode was actually marginally faster. That ruled out "bad
+provider" and pointed at something both shared: every `getAccountInfo` and
+`simulateTransaction` call in this codebase omitted the `commitment`
+parameter, which defaults to `finalized` — the level that genuinely does
+take ~10s+ to reach, regardless of node quality. Explicitly requesting
+`confirmed` commitment made the same account visible within ~0.1s of
+PumpPortal's own notification, measured repeatedly. Fixed in
+`executor.resolve_token_program_id`, `main._simulate`, and the position
+monitor's curve-state refresh.
+
+A second, unrelated bug surfaced once mints became visible: simulating the
+bare `buy` instruction failed with `AccountNotInitialized` on
+`associated_user`, since the wallet's own token account for a brand-new
+mint has never been created. Real pump.fun clients bundle an idempotent
+create-ATA instruction ahead of `buy` in the same transaction; `main.py`
+now does the same.
+
+With both fixed, buy simulations now reach pump.fun's own program logic
+and fail (or succeed) on legitimate business-logic grounds instead of
+infrastructure noise — see "Next: slippage tolerance" below for the
+current failure mode observed there.
+
+No RPC provider change was needed in the end; the constant-k trial was
+useful for isolating the cause (ruling out "bad node") but the actual fix
+was two lines of request parameters.
+
+## Next: slippage tolerance on buy's `max_sol_cost`
+
+With the above fixed, live buy simulations now fail with pump.fun's own
+custom Anchor errors (`Custom: 6000` / `Custom: 6002`, seen at the `buy`
+instruction itself) instead of infrastructure errors. The likely cause:
+`max_sol_cost_lamports` is currently set to the position size with zero
+slippage buffer, so any price movement between sizing the trade and the
+simulated/real execution (even a few hundred milliseconds) can push the
+required cost past an exact cap. `config.yaml` has no slippage-tolerance
+setting yet — `_simulate_sell` already flagged the equivalent gap on the
+sell side (`min_sol_output_lamports=0`, a placeholder, not a real floor).
+Next step: add a configurable slippage tolerance and pad both sides
+accordingly, then confirm the exact meaning of 6000 vs 6002 against
+pump.fun's error list if a copy can be found, rather than guessing.

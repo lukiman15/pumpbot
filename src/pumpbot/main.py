@@ -36,6 +36,7 @@ from solders.keypair import Keypair
 from solders.message import Message
 from solders.pubkey import Pubkey
 from solders.transaction import Transaction
+from spl.token.instructions import create_idempotent_associated_token_account
 
 from pumpbot.config import PROJECT_ROOT, Settings, load_settings
 from pumpbot.curve import (
@@ -62,6 +63,7 @@ from pumpbot.heartbeat import Heartbeat, HeartbeatReport
 from pumpbot.listener import MintListener
 from pumpbot.positions import Position, PositionManager
 from pumpbot.program import (
+    TOKEN_2022_PROGRAM_ID,
     derive_bonding_curve_pda,
     pick_buyback_fee_recipient,
     pick_fee_recipient,
@@ -87,6 +89,11 @@ class TradingState:
         self.entries_halted = False
         self._consecutive_failures = 0
         self._creators: dict[str, str] = {}
+        # token_program_id doesn't change over a mint's lifetime -- once a
+        # buy confirms it, a sell of the same mint can reuse it directly
+        # instead of paying another resolve_token_program_id round-trip
+        # (and its retries) against the same laggy RPC node.
+        self._token_programs: dict[str, str] = {}
 
     def record_failure(self, limit: int) -> None:
         self._consecutive_failures += 1
@@ -106,6 +113,12 @@ class TradingState:
 
     def creator_for(self, mint: str) -> str | None:
         return self._creators.get(mint)
+
+    def remember_token_program(self, mint: str, token_program_id: str) -> None:
+        self._token_programs[mint] = token_program_id
+
+    def token_program_for(self, mint: str) -> str | None:
+        return self._token_programs.get(mint)
 
 
 def _load_keypair(path: str) -> Keypair:
@@ -127,50 +140,60 @@ async def preflight(settings: Settings, rpc: RpcClient) -> Pubkey:
     return pubkey
 
 
-async def _simulate(rpc: RpcClient, ix, fee_payer: Pubkey) -> str | None:
-    """Builds an unsigned transaction around ix and simulates it against
-    live chain state. Returns None on success, or a string describing the
-    on-chain error. Never signs or sends anything."""
-    msg = Message.new_with_blockhash([ix], fee_payer, Hash.default())
+async def _simulate(rpc: RpcClient, instructions: list | object, fee_payer: Pubkey) -> str | None:
+    """Builds an unsigned transaction around instructions and simulates it
+    against live chain state. Returns None on success, or a string
+    describing the on-chain error. Never signs or sends anything.
+
+    Accepts either a single Instruction (for backward compatibility) or a
+    list of them, executed in order in one transaction -- real pump.fun
+    clients bundle a create-ATA instruction ahead of buy, and a live test
+    confirmed this project's simulations need to as well (see the
+    AccountNotInitialized finding on associated_user in this module's
+    docstring / commit history)."""
+    ix_list = instructions if isinstance(instructions, list) else [instructions]
+    msg = Message.new_with_blockhash(ix_list, fee_payer, Hash.default())
     tx = Transaction.new_unsigned(msg)
     raw_b64 = base64.b64encode(bytes(tx)).decode()
     result = await rpc.call(
         "simulateTransaction",
-        [raw_b64, {"encoding": "base64", "sigVerify": False, "replaceRecentBlockhash": True}],
+        [
+            raw_b64,
+            {
+                "encoding": "base64",
+                "sigVerify": False,
+                "replaceRecentBlockhash": True,
+                # Default commitment is `finalized`, which simulates against
+                # chain state as of ~10s ago on a brand-new mint -- see
+                # executor.py's resolve_token_program_id docstring for how
+                # that was measured. `confirmed` reflects state from ~0.1s
+                # after PumpPortal's own notification instead.
+                "commitment": "confirmed",
+            },
+        ],
     )
     err = result["value"]["err"]
     return None if err is None else str(err)
 
 
-async def _simulate_buy(
-    rpc: RpcClient, wallet_pubkey: Pubkey, candidate: Candidate, position_sol_lamports: int
-) -> tuple[bool, int, str | None, bool]:
-    """Returns (would_succeed, tokens_out_raw, error_summary, is_transient).
-
-    is_transient marks MintNotYetVisibleError specifically -- an expected,
-    recoverable RPC-propagation-lag condition for a brand-new mint, not
-    evidence of a real bug (see executor.py's docstring on it). Callers
-    should not count it toward the failsafe's consecutive-failure limit.
-    """
-    mint = Pubkey.from_string(candidate.mint)
-    try:
-        tokens_out_raw = sol_to_tokens(candidate.curve, position_sol_lamports)
-    except CurveCompleteError:
-        return False, 0, "curve already complete", False
-    if tokens_out_raw <= 0:
-        return False, 0, "zero tokens out at this size", False
-
-    try:
-        token_program_id = await resolve_token_program_id(rpc, mint)
-    except MintNotYetVisibleError as exc:
-        return False, tokens_out_raw, str(exc), True
-    except Exception as exc:  # noqa: BLE001 - summarized into the return value, not swallowed
-        return False, tokens_out_raw, f"resolve_token_program_id failed: {exc}", False
-
-    ix = build_buy_instruction(
+def _build_buy(
+    mint: Pubkey, wallet_pubkey: Pubkey, creator: Pubkey, token_program_id: Pubkey,
+    tokens_out_raw: int, position_sol_lamports: int,
+) -> list:
+    """Returns [create-ATA, buy] -- a live test found that simulating the
+    bare buy instruction alone fails with AccountNotInitialized on
+    associated_user for every brand-new mint, since the wallet has never
+    held this token before and nothing creates its ATA first. Real pump.fun
+    clients bundle an idempotent create-ATA instruction ahead of buy in the
+    same transaction; simulating buy alone was testing something no real
+    client actually sends."""
+    create_ata_ix = create_idempotent_associated_token_account(
+        payer=wallet_pubkey, owner=wallet_pubkey, mint=mint, token_program_id=token_program_id
+    )
+    buy_ix = build_buy_instruction(
         mint=mint,
         user=wallet_pubkey,
-        creator=Pubkey.from_string(candidate.creator),
+        creator=creator,
         token_program_id=token_program_id,
         fee_recipient=pick_fee_recipient(),
         buyback_fee_recipient=pick_buyback_fee_recipient(),
@@ -182,17 +205,86 @@ async def _simulate_buy(
         amount_tokens_raw=tokens_out_raw,
         max_sol_cost_lamports=position_sol_lamports,
     )
+    return [create_ata_ix, buy_ix]
+
+
+async def _simulate_buy(
+    rpc: RpcClient, wallet_pubkey: Pubkey, candidate: Candidate, position_sol_lamports: int
+) -> tuple[bool, int, str | None, bool, str | None]:
+    """Returns (would_succeed, tokens_out_raw, error_summary, is_transient,
+    token_program_id_used).
+
+    is_transient marks MintNotYetVisibleError specifically -- an expected,
+    recoverable RPC-propagation-lag condition for a brand-new mint, not
+    evidence of a real bug (see executor.py's docstring on it). Callers
+    should not count it toward the failsafe's consecutive-failure limit.
+
+    Optimistically tries Token-2022 first, with NO getAccountInfo call --
+    every sampled pump.fun mint has used Token-2022 (0 counterexamples, see
+    program.py's module docstring), and a wrong guess here is caught safely
+    by simulateTransaction before any real money could move, so there's no
+    money-risk in guessing. Saves one RPC round-trip in the common case;
+    falls back to resolve_token_program_id's retries if the guess fails.
+    """
+    mint = Pubkey.from_string(candidate.mint)
+    try:
+        tokens_out_raw = sol_to_tokens(candidate.curve, position_sol_lamports)
+    except CurveCompleteError:
+        return False, 0, "curve already complete", False, None
+    if tokens_out_raw <= 0:
+        return False, 0, "zero tokens out at this size", False, None
+
+    creator = Pubkey.from_string(candidate.creator)
+    optimistic_ix = _build_buy(
+        mint, wallet_pubkey, creator, TOKEN_2022_PROGRAM_ID, tokens_out_raw, position_sol_lamports
+    )
+    optimistic_error = await _simulate(rpc, optimistic_ix, wallet_pubkey)
+    if optimistic_error is None:
+        return True, tokens_out_raw, None, False, str(TOKEN_2022_PROGRAM_ID)
+
+    try:
+        token_program_id = await resolve_token_program_id(rpc, mint)
+    except MintNotYetVisibleError as exc:
+        return False, tokens_out_raw, str(exc), True, None
+    except Exception as exc:  # noqa: BLE001 - summarized into the return value, not swallowed
+        return False, tokens_out_raw, f"resolve_token_program_id failed: {exc}", False, None
+
+    ix = _build_buy(
+        mint, wallet_pubkey, creator, token_program_id, tokens_out_raw, position_sol_lamports
+    )
     error = await _simulate(rpc, ix, wallet_pubkey)
-    return error is None, tokens_out_raw, error, False
+    return error is None, tokens_out_raw, error, False, str(token_program_id)
 
 
 async def _simulate_sell(
-    rpc: RpcClient, wallet_pubkey: Pubkey, mint: Pubkey, creator: Pubkey, tokens_raw: int
+    rpc: RpcClient,
+    wallet_pubkey: Pubkey,
+    mint: Pubkey,
+    creator: Pubkey,
+    tokens_raw: int,
+    known_token_program_id: Pubkey | None = None,
 ) -> str | None:
-    try:
-        token_program_id = await resolve_token_program_id(rpc, mint)
-    except Exception as exc:  # noqa: BLE001 - summarized into the return value, not swallowed
-        return f"resolve_token_program_id failed: {exc}"
+    """known_token_program_id skips the resolve_token_program_id round-trip
+    entirely -- the token program doesn't change over a mint's lifetime, so
+    if the earlier buy already confirmed it, a sell of the same mint can
+    reuse it directly instead of paying the same laggy RPC lookup again.
+
+    Inherent DRY_RUN ceiling, not a bug: since buys are only ever simulated
+    here, never actually sent, the wallet never really holds the tokens a
+    simulated sell claims to sell -- unlike the buy path (whose only
+    blocker was the missing create-ATA instruction, now fixed), a sell
+    simulation can't reach a genuine "would succeed" here regardless of
+    fixes on this side. It still validates everything else about the
+    instruction (account ordering, data encoding), and doesn't need a
+    create-ATA instruction itself since a real successful buy would have
+    already created it."""
+    if known_token_program_id is not None:
+        token_program_id = known_token_program_id
+    else:
+        try:
+            token_program_id = await resolve_token_program_id(rpc, mint)
+        except Exception as exc:  # noqa: BLE001 - summarized into the return value, not swallowed
+            return f"resolve_token_program_id failed: {exc}"
 
     ix = build_sell_instruction(
         mint=mint,
@@ -236,7 +328,7 @@ async def run_trader(
             continue
 
         try:
-            would_succeed, tokens_out_raw, error, is_transient = await _simulate_buy(
+            would_succeed, tokens_out_raw, error, is_transient, token_program_id = await _simulate_buy(
                 rpc, wallet_pubkey, candidate, position_sol_lamports
             )
         except Exception:
@@ -272,6 +364,8 @@ async def run_trader(
         )
         position_manager.open(position)
         state.remember_creator(candidate.mint, candidate.creator)
+        if token_program_id is not None:
+            state.remember_token_program(candidate.mint, token_program_id)
         heartbeat.record_trade()
 
 
@@ -293,7 +387,8 @@ async def run_position_monitor(
             try:
                 bonding_curve_pda = derive_bonding_curve_pda(mint)
                 info = await rpc.call(
-                    "getAccountInfo", [str(bonding_curve_pda), {"encoding": "base64"}]
+                    "getAccountInfo",
+                    [str(bonding_curve_pda), {"encoding": "base64", "commitment": "confirmed"}],
                 )
                 value = info.get("value")
                 if value is None:
@@ -313,6 +408,7 @@ async def run_position_monitor(
                 continue
 
             creator = state.creator_for(position.mint)
+            known_token_program = state.token_program_for(position.mint)
             tokens_to_sell_raw = round(
                 position.tokens_remaining * decision.fraction * 10**TOKEN_DECIMALS
             )
@@ -322,7 +418,16 @@ async def run_position_monitor(
             elif tokens_to_sell_raw > 0:
                 try:
                     error = await _simulate_sell(
-                        rpc, wallet_pubkey, mint, Pubkey.from_string(creator), tokens_to_sell_raw
+                        rpc,
+                        wallet_pubkey,
+                        mint,
+                        Pubkey.from_string(creator),
+                        tokens_to_sell_raw,
+                        known_token_program_id=(
+                            Pubkey.from_string(known_token_program)
+                            if known_token_program is not None
+                            else None
+                        ),
                     )
                 except Exception as exc:  # noqa: BLE001 - summarized into the return value, not swallowed
                     error = f"sell simulation crashed: {exc}"

@@ -85,23 +85,22 @@ async def resolve_token_program_id(
     """Every sampled pump.fun mint used Token-2022, not legacy SPL Token --
     see program.py's module docstring. Never assume; always check.
 
-    A brand-new mint is frequently not yet visible to this RPC node at the
-    moment PumpPortal notifies us of it -- the same propagation lag
-    scripts/probe.py discovered and handled with a 20-second wait before its
-    own getTransaction lookups. A live test against this project's actual
-    QuickNode endpoint showed 3 retries at 1s apart (~2-3s total) is NOT
-    enough to close this gap for many mints -- the lag can exceed that. A
-    sniper can't afford probe.py's full 20-second wait either (Phase 0
-    measured a median buy-queue rank of 0 -- competitive buys land within
-    roughly the same window as mint creation), so there's no retry budget
-    here that reliably closes the gap without also killing competitiveness.
-    This is a real, unresolved infrastructure constraint -- not a bug this
-    function can fix -- and MintNotYetVisibleError exists so callers don't
-    mistake "RPC hasn't caught up yet" for "something is broken."
+    What looked like a ~10s RPC propagation lag on a brand-new mint (both
+    on QuickNode and on a second provider tested side-by-side, ruling out
+    "bad node") turned out to be this call defaulting to `finalized`
+    commitment, which genuinely does take that long to wait for -- it isn't
+    infrastructure lag at all. `confirmed` commitment (still far short of a
+    real send-and-confirm cycle, but enough that a wrong price/curve state
+    isn't likely to have moved) was measured available within ~0.1s of
+    PumpPortal's own notification, live, repeatedly. The retry loop below is
+    kept as a safety margin for the genuinely rare case a mint isn't even
+    `confirmed` yet, not as the primary fix.
     """
     last_exc: UnknownTokenProgramError | None = None
     for attempt in range(retries):
-        info = await rpc.call("getAccountInfo", [str(mint), {"encoding": "base64"}])
+        info = await rpc.call(
+            "getAccountInfo", [str(mint), {"encoding": "base64", "commitment": "confirmed"}]
+        )
         if info is not None and info.get("value") is not None:
             owner = Pubkey.from_string(info["value"]["owner"])
             if owner not in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
