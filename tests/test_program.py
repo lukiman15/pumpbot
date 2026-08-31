@@ -3,13 +3,19 @@ from solders.pubkey import Pubkey
 from pumpbot.program import (
     ASSOCIATED_TOKEN_PROGRAM_ID,
     BUY_DISCRIMINATOR,
+    FEE_CONFIG,
+    FEE_PROGRAM_ID,
     PUMP_FUN_PROGRAM_ID,
     SELL_DISCRIMINATOR,
     TOKEN_2022_PROGRAM_ID,
     TOKEN_PROGRAM_ID,
     derive_associated_token_address,
     derive_bonding_curve_pda,
+    derive_creator_vault_pda,
+    derive_event_authority_pda,
     derive_global_pda,
+    derive_global_volume_accumulator_pda,
+    derive_user_volume_accumulator_pda,
 )
 
 
@@ -65,3 +71,44 @@ def test_known_program_ids_are_well_formed():
     assert PUMP_FUN_PROGRAM_ID is not None
     assert ASSOCIATED_TOKEN_PROGRAM_ID is not None
     assert TOKEN_PROGRAM_ID != TOKEN_2022_PROGRAM_ID
+
+
+# The following four match real on-chain values from 3+ distinct live buy
+# transactions (see program.py's module docstring for the full account map
+# and how each was checked) -- not just internally self-consistent.
+
+
+def test_derive_creator_vault_pda_matches_confirmed_live_values():
+    cases = {
+        "CG44pjEEhAirnKrD2Ajp7gzLaMQ2QHyqZAxtPKY4FXAk": "F6FoWChTFCZ2TVHWtMEVATH5GppmJVLDypGvdyYCByQb",
+        "3wxDfDhShrp6gG8ptXu5ZrJ5rBbw25AkDijQZWpmbTWY": "CT6ysG4BBGEi6NiMM2txSs9gvFtdLn4kRmJWY7Zke81W",
+        "8wMiWbCHi3BqcqHAVzSgGTQrW1EWmNgBfzrAgBo1bUGA": "4tzF5g5ZNbh3TR7GvhsBiqULfx75eyY1WrJsCjUUvuXW",
+    }
+    for creator, expected_vault in cases.items():
+        vault = derive_creator_vault_pda(Pubkey.from_string(creator))
+        assert str(vault) == expected_vault
+
+
+def test_derive_event_authority_pda_matches_confirmed_live_value():
+    assert str(derive_event_authority_pda()) == "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1"
+
+
+def test_derive_global_volume_accumulator_pda_matches_confirmed_live_value():
+    assert (
+        str(derive_global_volume_accumulator_pda())
+        == "Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y"
+    )
+
+
+def test_derive_user_volume_accumulator_pda_matches_confirmed_live_values():
+    cases = {
+        "BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s": "FGFrX2q1iAjyAojjeyFDxXqdmvegjPpSWsrPmrJjeQ2f",
+        "ATQfqM1KjEv3hMhRX3NUaCa5V9sYgC2gk6YJKNr4R3uq": "9Ri9ysqtBKVHzeFj3QqqothoWEZyPErj4EEAHm3WRXUa",
+    }
+    for user, expected_uva in cases.items():
+        uva = derive_user_volume_accumulator_pda(Pubkey.from_string(user))
+        assert str(uva) == expected_uva
+
+
+def test_fee_program_and_fee_config_constants_are_distinct():
+    assert FEE_PROGRAM_ID != FEE_CONFIG
