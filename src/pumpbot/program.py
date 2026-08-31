@@ -49,21 +49,32 @@ BUY_ACCOUNTS order (index: name -- how it was confirmed):
                                      executable=true, owned by the BPF
                                      upgradeable loader -- a real program, not
                                      a data PDA
-  16 UNRESOLVED -- NOT the same as [12]. An earlier pass wrongly concluded
-      this duplicates global_volume_accumulator because they happened to
-      coincide in the very first sample decoded; sampling 4 more buys
-      disproved that (different value per sample, varying with BOTH user
-      and mint -- same user, different mint gives a different [16]). The
-      address does not exist on-chain yet in any sample seen (uninitialized
-      / lazily created on first use, most likely an ATA-shaped PDA keyed by
-      something like the account at [13] -- but no ATA or PDA-seed
-      hypothesis tried so far reproduces it, including guesses against
-      wrapped SOL and against the mint itself under both token programs).
-      Do not populate this position by guessing. buy_v2's published account
-      list separately names both `user_volume_accumulator` (confirmed at
-      [13] above) and `associated_user_volume_accumulator` -- this is
-      almost certainly the legacy equivalent of the latter, but that is an
-      inference, not a confirmed derivation.
+  16 UNKNOWN IDENTITY, CONFIRMED INERT. NOT the same as [12]. An earlier
+      pass wrongly concluded this duplicates global_volume_accumulator
+      because they happened to coincide in the very first sample decoded;
+      sampling 4 more buys disproved that (different value per sample,
+      varying with BOTH user and mint -- same user, different mint gives a
+      different [16]). The address does not exist on-chain in any sample
+      seen, even after being referenced by multiple successful transactions
+      -- so it's never read from or written to as an initialized account.
+      No PDA/ATA hypothesis tried reproduces it (wrapped SOL or the mint
+      itself under either token program, creator+mint, literal doc-name-
+      string seeds -- the last of which crashed with "Unable to find a
+      viable program address bump seed" because the 35-byte seed string
+      exceeds Solana's 32-byte-per-seed limit).
+
+      RESOLVED (practically, not by derivation): simulateTransaction against
+      live current chain state, with this position replaced by a freshly
+      generated, completely unrelated pubkey, still runs the full buy
+      end-to-end -- fee-program GetFees CPI, TransferChecked, pump.fun's own
+      final CPI, `err: null` -- for both buy and sell. The current on-chain
+      program does not validate this account's identity. Its semantic
+      purpose (why the account list includes it at all -- most plausibly an
+      unused or not-yet-activated `associated_user_volume_accumulator`
+      slot, per buy_v2's published account list, but that's still inference)
+      remains genuinely unknown. What's no longer in question is whether an
+      arbitrary value here is safe to submit: it is, as confirmed by
+      simulation (not yet by an actual send -- see note in executor.py).
   17 buyback_fee_recipient       -- CONFIRMED DISTINCT from [1]'s fee_recipient
       (they vary independently across samples, including staying different
       when [1] repeats) -- every observed value matched pump.fun's published
@@ -71,10 +82,17 @@ BUY_ACCOUNTS order (index: name -- how it was confirmed):
       the "Normal"/"Reserved" lists [1] draws from
 
 Instruction data (buy): 8-byte discriminator + u64 amount (LE, tokens out,
-raw units) + u64 max_sol_cost (LE, lamports). A live sample executed
-successfully with EXACTLY these 24 bytes and no more -- a trailing
-Option<bool> field (probably `track_volume`) is optional and safe to omit
-entirely; do not add it.
+raw units) + u64 max_sol_cost (LE, lamports). Correction: an earlier pass
+claimed a live sample "executed successfully" with exactly these 24 bytes --
+that was wrong. The captured sample transaction actually FAILED on-chain
+(err: InstructionError [6, Custom 6002], confirmed via getSignaturesForAddress
+on one of its accounts) -- the account list and data bytes are still valid
+evidence of real submitted structure (a failed tx still reveals what was
+sent), but "executed successfully" overstated it. The 24-byte length and
+shape are now confirmed instead via simulateTransaction against live chain
+state, which does run end-to-end successfully (see [16]'s note above) -- a
+trailing Option<bool> field (probably `track_volume`) is optional and safe
+to omit entirely; do not add it.
 
 Token-2022 finding: every sampled mint's owner was Token-2022
 (TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb), not legacy SPL Token,
@@ -116,12 +134,14 @@ SELL_ACCOUNTS order (16 accounts, not 18 -- see below):
   12 fee_config                   -- shifted up from buy's [14] because sell
                                      has no volume-accumulator accounts at all
   13 fee_program                  -- shifted up from buy's [15]
-  14 UNRESOLVED -- the same unresolved account as buy's [16] (not the same
-      VALUE, but the same kind of slot): across samples it's constant for a
-      given (user, mint) pair and varies when either changes, matching buy's
-      characterization exactly. No PDA/ATA hypothesis tried for buy's [16]
-      has been retried against this to actually resolve it -- still opaque,
-      still gated behind a required parameter, do not guess.
+  14 UNKNOWN IDENTITY, CONFIRMED INERT -- the same kind of slot as buy's [16]
+      (not the same VALUE): across samples it's constant for a given (user,
+      mint) pair and varies when either changes, matching buy's
+      characterization exactly, and likewise never exists on-chain despite
+      being referenced by successful transactions. Same simulateTransaction
+      result as buy's [16]: substituting a freshly generated, unrelated
+      pubkey here still runs the full sell end-to-end with `err: null`. See
+      the full note under buy's [16] above -- it applies identically here.
   15 buyback_fee_recipient       -- confirmed against pump.fun's published
       "Buyback Fee Recipients" list (FEE_RECIPIENTS.md), same role as buy's
       [17]
@@ -262,14 +282,13 @@ def verify() -> None:
     print(f"buy discriminator          = {BUY_DISCRIMINATOR.hex()} (confirmed live, 6 samples)")
     print(f"sell discriminator         = {SELL_DISCRIMINATOR.hex()} (confirmed live, 13 samples)")
     print()
-    print("Confirmed: 17 of buy's 18 accounts (see module docstring). Account")
-    print("[16] is NOT resolved -- it doesn't exist on-chain in any sample seen")
-    print("and no PDA/ATA hypothesis tried reproduces it. Do not send a live buy")
-    print("until it's resolved or explicitly supplied by a caller who has verified it.")
-    print("Confirmed: sell has its OWN 16-account layout, NOT symmetric with buy --")
-    print("creator_vault/token_program are swapped vs buy, and both volume-")
-    print("accumulator accounts are absent entirely. Its own unresolved slot")
-    print("(position [14]) is the same kind of gap as buy's [16] -- still unsolved.")
+    print("Confirmed: 17 of buy's 18 accounts, and 15-16 of sell's 16 (see")
+    print("module docstring). Buy's [16] and sell's [14] have unknown identity")
+    print("-- no PDA/ATA hypothesis reproduces either -- but simulateTransaction")
+    print("confirms neither is validated by the current on-chain program: an")
+    print("arbitrary substitute succeeds end-to-end for both instructions. Sell")
+    print("is NOT symmetric with buy: creator_vault/token_program are swapped,")
+    print("and sell has no volume-accumulator accounts at all (16 vs 18).")
 
 
 if __name__ == "__main__":

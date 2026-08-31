@@ -9,12 +9,20 @@ of work not covered here.
 
 Status: 17 of 18 buy accounts are confirmed, and sell has its own
 independently-confirmed 16-account layout (NOT symmetric with buy -- see
-program.py's module docstring). Both layouts have one unresolved account
-each (buy's [16], sell's [14] -- same kind of gap, different position and
-value). Both build functions require it as an explicit `unresolved_account`
-parameter with no default, specifically so nothing can call them without
-consciously deciding what to do about it. DO NOT send a live transaction
-built from either function until that gap is resolved.
+program.py's module docstring). Both layouts have one account of unknown
+identity (buy's [16], sell's [14] -- same kind of gap, different position
+and value) that no PDA/ATA hypothesis reproduces. That no longer blocks
+sending real transactions: simulateTransaction against live chain state
+confirms the current on-chain program doesn't validate this account's
+identity for either instruction -- an arbitrary, freshly generated pubkey
+runs the full buy/sell end-to-end with `err: null`. Both build functions
+still require it as an explicit `unresolved_account` parameter with no
+default, not because an arbitrary value is risky (it's been shown not to
+be, by simulation) but because a future program upgrade could start
+validating it, and a silent default would hide that when it happens.
+simulateTransaction is not the same as an actual send, though -- run every
+transaction through simulateTransaction immediately before sending until
+an actual live send has removed all doubt.
 
 is_signer/is_writable flags below are inferred from what each account
 plausibly does during a buy (lamports/token balances change -> writable),
@@ -109,13 +117,12 @@ def build_buy_instruction(
     for buyback_fee_recipient) -- an arbitrary address here is not
     confirmed to work and was not what any sampled transaction did.
 
-    unresolved_account is exactly what it says: account [16] in
-    program.py's verified buy map is NOT resolved (see that module's
-    docstring) -- no PDA/ATA hypothesis tried reproduces the on-chain
-    value, which doesn't even exist yet in any sample seen. This parameter
-    has no default and no derivation on purpose, so nobody can call this
-    function without consciously supplying something for it. DO NOT send a
-    real transaction built from this function until it's resolved.
+    unresolved_account is account [16] in program.py's verified buy map --
+    its identity is unknown (no PDA/ATA hypothesis reproduces it, see that
+    module's docstring), but simulateTransaction confirms the current
+    on-chain program doesn't validate it: any pubkey works. This parameter
+    still has no default on purpose, so nobody can call this function
+    without consciously supplying something for it.
     """
     global_pda = derive_global_pda()
     bonding_curve = derive_bonding_curve_pda(mint)
