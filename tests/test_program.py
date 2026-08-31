@@ -3,9 +3,12 @@ from solders.pubkey import Pubkey
 from pumpbot.program import (
     ASSOCIATED_TOKEN_PROGRAM_ID,
     BUY_DISCRIMINATOR,
+    BUYBACK_FEE_RECIPIENTS,
     FEE_CONFIG,
     FEE_PROGRAM_ID,
+    NORMAL_FEE_RECIPIENTS,
     PUMP_FUN_PROGRAM_ID,
+    RESERVED_FEE_RECIPIENTS,
     SELL_DISCRIMINATOR,
     TOKEN_2022_PROGRAM_ID,
     TOKEN_PROGRAM_ID,
@@ -16,6 +19,8 @@ from pumpbot.program import (
     derive_global_pda,
     derive_global_volume_accumulator_pda,
     derive_user_volume_accumulator_pda,
+    pick_buyback_fee_recipient,
+    pick_fee_recipient,
 )
 
 
@@ -112,3 +117,17 @@ def test_derive_user_volume_accumulator_pda_matches_confirmed_live_values():
 
 def test_fee_program_and_fee_config_constants_are_distinct():
     assert FEE_PROGRAM_ID != FEE_CONFIG
+
+
+def test_pick_fee_recipient_draws_from_normal_or_reserved_pools():
+    combined = set(NORMAL_FEE_RECIPIENTS) | set(RESERVED_FEE_RECIPIENTS)
+    for _ in range(20):
+        assert str(pick_fee_recipient()) in combined
+
+
+def test_pick_buyback_fee_recipient_draws_from_buyback_pool_only():
+    combined = set(NORMAL_FEE_RECIPIENTS) | set(RESERVED_FEE_RECIPIENTS)
+    for _ in range(20):
+        picked = str(pick_buyback_fee_recipient())
+        assert picked in set(BUYBACK_FEE_RECIPIENTS)
+        assert picked not in combined

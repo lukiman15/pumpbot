@@ -36,6 +36,7 @@ before ever sending for real.
 
 from __future__ import annotations
 
+import asyncio
 import struct
 
 from solders.instruction import AccountMeta, Instruction
@@ -67,16 +68,52 @@ class UnknownTokenProgramError(RuntimeError):
     would be wrong, so refuse rather than guess."""
 
 
-async def resolve_token_program_id(rpc: RpcClient, mint: Pubkey) -> Pubkey:
+class MintNotYetVisibleError(UnknownTokenProgramError):
+    """Raised when the mint account still isn't visible after retrying --
+    distinct from UnknownTokenProgramError's other case (a resolved but
+    unexpected owner) because this one is an expected, recoverable
+    condition for a brand-new mint, not evidence of a real bug. Callers
+    should treat this differently from other failures (see main.py's
+    failsafe handling) -- it isn't the kind of failure the failsafe was
+    built to detect.
+    """
+
+
+async def resolve_token_program_id(
+    rpc: RpcClient, mint: Pubkey, retries: int = 3, retry_delay_seconds: float = 1.0
+) -> Pubkey:
     """Every sampled pump.fun mint used Token-2022, not legacy SPL Token --
-    see program.py's module docstring. Never assume; always check."""
-    info = await rpc.call("getAccountInfo", [str(mint), {"encoding": "base64"}])
-    if info is None or info.get("value") is None:
-        raise UnknownTokenProgramError(f"mint account not found: {mint}")
-    owner = Pubkey.from_string(info["value"]["owner"])
-    if owner not in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
-        raise UnknownTokenProgramError(f"mint {mint} owned by unexpected program {owner}")
-    return owner
+    see program.py's module docstring. Never assume; always check.
+
+    A brand-new mint is frequently not yet visible to this RPC node at the
+    moment PumpPortal notifies us of it -- the same propagation lag
+    scripts/probe.py discovered and handled with a 20-second wait before its
+    own getTransaction lookups. A live test against this project's actual
+    QuickNode endpoint showed 3 retries at 1s apart (~2-3s total) is NOT
+    enough to close this gap for many mints -- the lag can exceed that. A
+    sniper can't afford probe.py's full 20-second wait either (Phase 0
+    measured a median buy-queue rank of 0 -- competitive buys land within
+    roughly the same window as mint creation), so there's no retry budget
+    here that reliably closes the gap without also killing competitiveness.
+    This is a real, unresolved infrastructure constraint -- not a bug this
+    function can fix -- and MintNotYetVisibleError exists so callers don't
+    mistake "RPC hasn't caught up yet" for "something is broken."
+    """
+    last_exc: UnknownTokenProgramError | None = None
+    for attempt in range(retries):
+        info = await rpc.call("getAccountInfo", [str(mint), {"encoding": "base64"}])
+        if info is not None and info.get("value") is not None:
+            owner = Pubkey.from_string(info["value"]["owner"])
+            if owner not in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+                raise UnknownTokenProgramError(
+                    f"mint {mint} owned by unexpected program {owner}"
+                )
+            return owner
+        last_exc = MintNotYetVisibleError(f"mint account not found: {mint}")
+        if attempt < retries - 1:
+            await asyncio.sleep(retry_delay_seconds)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _encode_buy_data(amount_tokens_raw: int, max_sol_cost_lamports: int) -> bytes:

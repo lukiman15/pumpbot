@@ -1,0 +1,418 @@
+"""Wires config, rpc, listener, filters, curve, positions, heartbeat, and
+executor into the live decision loop.
+
+Entry point: `python -m pumpbot.main`.
+
+Scope of this version: the full pipeline runs live against real chain state
+-- new mints arrive from PumpPortal, pass Tier1Filter, get sized against
+live bonding-curve reserves, and every buy/sell decision is built into a
+real `Instruction` (via executor.py's verified account orderings) and run
+through `simulateTransaction`. That's a read-only RPC call against current
+chain state -- it tells us whether a real send would succeed right now,
+with zero risk, since nothing is signed or broadcast.
+
+Signing and sending a REAL transaction is NOT built yet: no keypair signs
+anything, no blockhash is fetched for real submission, there's no
+confirmation-polling loop, and ATA lifecycle (create-before-buy, close-
+after-full-exit) doesn't exist. Wiring an actual send is a distinct,
+higher-stakes piece of work from wiring the decision pipeline together, and
+deliberately isn't folded into this pass. Because DRY_RUN=false with none
+of that built would silently do nothing useful while looking like it might
+trade, `main()` refuses to start unless `secrets.dry_run` is true rather
+than leaving that failure mode to be discovered later.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import time
+from pathlib import Path
+
+from solders.hash import Hash
+from solders.keypair import Keypair
+from solders.message import Message
+from solders.pubkey import Pubkey
+from solders.transaction import Transaction
+
+from pumpbot.config import PROJECT_ROOT, Settings, load_settings
+from pumpbot.curve import (
+    LAMPORTS_PER_SOL,
+    TOKEN_DECIMALS,
+    CurveCompleteError,
+    decode_bonding_curve,
+    sol_to_tokens,
+    spot_price_sol_per_token,
+)
+from pumpbot.executor import (
+    MintNotYetVisibleError,
+    build_buy_instruction,
+    build_sell_instruction,
+    resolve_token_program_id,
+)
+from pumpbot.filters.tier1 import (
+    Candidate,
+    Tier1Filter,
+    load_creator_blocklist,
+    load_name_symbol_blocklist,
+)
+from pumpbot.heartbeat import Heartbeat, HeartbeatReport
+from pumpbot.listener import MintListener
+from pumpbot.positions import Position, PositionManager
+from pumpbot.program import (
+    derive_bonding_curve_pda,
+    pick_buyback_fee_recipient,
+    pick_fee_recipient,
+)
+from pumpbot.rpc import RpcClient
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("pumpbot.main")
+
+CANDIDATE_QUEUE_MAXSIZE = 100
+POSITION_MONITOR_INTERVAL_SECONDS = 2.0
+
+
+class PreflightError(RuntimeError):
+    """Raised when startup conditions aren't safe to trade under."""
+
+
+class TradingState:
+    """Mutable state shared between the trader, monitor, and reconciliation
+    tasks that doesn't belong inside PositionManager itself."""
+
+    def __init__(self) -> None:
+        self.entries_halted = False
+        self._consecutive_failures = 0
+        self._creators: dict[str, str] = {}
+
+    def record_failure(self, limit: int) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= limit and not self.entries_halted:
+            self.entries_halted = True
+            logger.critical(
+                "failsafe: %d consecutive failures, halting new entries "
+                "(existing positions and reconciliation are unaffected)",
+                self._consecutive_failures,
+            )
+
+    def record_success(self) -> None:
+        self._consecutive_failures = 0
+
+    def remember_creator(self, mint: str, creator: str) -> None:
+        self._creators[mint] = creator
+
+    def creator_for(self, mint: str) -> str | None:
+        return self._creators.get(mint)
+
+
+def _load_keypair(path: str) -> Keypair:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return Keypair.from_bytes(bytes(raw))
+
+
+async def preflight(settings: Settings, rpc: RpcClient) -> Pubkey:
+    keypair = _load_keypair(settings.secrets.wallet_keypair_path)
+    pubkey = keypair.pubkey()
+    balance = await rpc.get_balance_sol(str(pubkey))
+    wallet_cfg = settings.config.wallet
+    if not (wallet_cfg.min_balance_sol <= balance <= wallet_cfg.max_balance_sol):
+        raise PreflightError(
+            f"wallet {pubkey} balance {balance:.5f} SOL outside configured range "
+            f"[{wallet_cfg.min_balance_sol}, {wallet_cfg.max_balance_sol}]"
+        )
+    logger.info("preflight ok: wallet=%s balance=%.5f SOL", pubkey, balance)
+    return pubkey
+
+
+async def _simulate(rpc: RpcClient, ix, fee_payer: Pubkey) -> str | None:
+    """Builds an unsigned transaction around ix and simulates it against
+    live chain state. Returns None on success, or a string describing the
+    on-chain error. Never signs or sends anything."""
+    msg = Message.new_with_blockhash([ix], fee_payer, Hash.default())
+    tx = Transaction.new_unsigned(msg)
+    raw_b64 = base64.b64encode(bytes(tx)).decode()
+    result = await rpc.call(
+        "simulateTransaction",
+        [raw_b64, {"encoding": "base64", "sigVerify": False, "replaceRecentBlockhash": True}],
+    )
+    err = result["value"]["err"]
+    return None if err is None else str(err)
+
+
+async def _simulate_buy(
+    rpc: RpcClient, wallet_pubkey: Pubkey, candidate: Candidate, position_sol_lamports: int
+) -> tuple[bool, int, str | None, bool]:
+    """Returns (would_succeed, tokens_out_raw, error_summary, is_transient).
+
+    is_transient marks MintNotYetVisibleError specifically -- an expected,
+    recoverable RPC-propagation-lag condition for a brand-new mint, not
+    evidence of a real bug (see executor.py's docstring on it). Callers
+    should not count it toward the failsafe's consecutive-failure limit.
+    """
+    mint = Pubkey.from_string(candidate.mint)
+    try:
+        tokens_out_raw = sol_to_tokens(candidate.curve, position_sol_lamports)
+    except CurveCompleteError:
+        return False, 0, "curve already complete", False
+    if tokens_out_raw <= 0:
+        return False, 0, "zero tokens out at this size", False
+
+    try:
+        token_program_id = await resolve_token_program_id(rpc, mint)
+    except MintNotYetVisibleError as exc:
+        return False, tokens_out_raw, str(exc), True
+    except Exception as exc:  # noqa: BLE001 - summarized into the return value, not swallowed
+        return False, tokens_out_raw, f"resolve_token_program_id failed: {exc}", False
+
+    ix = build_buy_instruction(
+        mint=mint,
+        user=wallet_pubkey,
+        creator=Pubkey.from_string(candidate.creator),
+        token_program_id=token_program_id,
+        fee_recipient=pick_fee_recipient(),
+        buyback_fee_recipient=pick_buyback_fee_recipient(),
+        # Confirmed via simulateTransaction (see program.py's module
+        # docstring) that this account's identity isn't validated by the
+        # current on-chain program -- the wallet's own pubkey is as good a
+        # value as any here.
+        unresolved_account=wallet_pubkey,
+        amount_tokens_raw=tokens_out_raw,
+        max_sol_cost_lamports=position_sol_lamports,
+    )
+    error = await _simulate(rpc, ix, wallet_pubkey)
+    return error is None, tokens_out_raw, error, False
+
+
+async def _simulate_sell(
+    rpc: RpcClient, wallet_pubkey: Pubkey, mint: Pubkey, creator: Pubkey, tokens_raw: int
+) -> str | None:
+    try:
+        token_program_id = await resolve_token_program_id(rpc, mint)
+    except Exception as exc:  # noqa: BLE001 - summarized into the return value, not swallowed
+        return f"resolve_token_program_id failed: {exc}"
+
+    ix = build_sell_instruction(
+        mint=mint,
+        user=wallet_pubkey,
+        creator=creator,
+        token_program_id=token_program_id,
+        fee_recipient=pick_fee_recipient(),
+        buyback_fee_recipient=pick_buyback_fee_recipient(),
+        unresolved_account=wallet_pubkey,
+        amount_tokens_raw=tokens_raw,
+        # Instrumentation only, not a real sell -- a real one needs a min
+        # output floor derived from config.yaml's slippage tolerance, which
+        # doesn't exist yet (see this module's docstring on scope).
+        min_sol_output_lamports=0,
+    )
+    return await _simulate(rpc, ix, wallet_pubkey)
+
+
+async def run_trader(
+    settings: Settings,
+    rpc: RpcClient,
+    wallet_pubkey: Pubkey,
+    queue: asyncio.Queue[Candidate],
+    position_manager: PositionManager,
+    heartbeat: Heartbeat,
+    state: TradingState,
+) -> None:
+    position_sol = settings.config.trading.position_sol
+    position_sol_lamports = int(position_sol * LAMPORTS_PER_SOL)
+    failure_limit = settings.config.failsafe.consecutive_failure_limit
+
+    while True:
+        candidate = await queue.get()
+        heartbeat.record_candidate()
+
+        if state.entries_halted:
+            logger.warning("skip mint=%s: entries halted by failsafe", candidate.mint)
+            continue
+        if not position_manager.can_open_new():
+            logger.info("skip mint=%s: max_concurrent_positions reached", candidate.mint)
+            continue
+
+        try:
+            would_succeed, tokens_out_raw, error, is_transient = await _simulate_buy(
+                rpc, wallet_pubkey, candidate, position_sol_lamports
+            )
+        except Exception:
+            logger.exception("buy simulation crashed for mint=%s", candidate.mint)
+            state.record_failure(failure_limit)
+            continue
+
+        if not would_succeed:
+            if is_transient:
+                # Mint not yet visible to this RPC node -- an expected,
+                # recoverable condition on a brand-new mint, not a sign
+                # anything is broken. Doesn't count toward the failsafe.
+                logger.info("skip mint=%s: %s", candidate.mint, error)
+            else:
+                logger.info("simulated buy would fail mint=%s reason=%s", candidate.mint, error)
+                state.record_failure(failure_limit)
+            continue
+
+        state.record_success()
+        tokens_out_whole = tokens_out_raw / 10**TOKEN_DECIMALS
+        entry_price_sol = position_sol / tokens_out_whole
+        logger.info(
+            "[DRY RUN] simulated buy would succeed mint=%s position_sol=%.4f "
+            "tokens=%.2f entry_price=%.10f",
+            candidate.mint, position_sol, tokens_out_whole, entry_price_sol,
+        )
+
+        position = Position(
+            mint=candidate.mint,
+            entry_price_sol=entry_price_sol,
+            entry_tokens=tokens_out_whole,
+            opened_at=time.monotonic(),
+        )
+        position_manager.open(position)
+        state.remember_creator(candidate.mint, candidate.creator)
+        heartbeat.record_trade()
+
+
+async def run_position_monitor(
+    settings: Settings,
+    rpc: RpcClient,
+    wallet_pubkey: Pubkey,
+    position_manager: PositionManager,
+    heartbeat: Heartbeat,
+    state: TradingState,
+) -> None:
+    exits_cfg = settings.config.exits
+    failure_limit = settings.config.failsafe.consecutive_failure_limit
+
+    while True:
+        await asyncio.sleep(POSITION_MONITOR_INTERVAL_SECONDS)
+        for position in position_manager.all_open():
+            mint = Pubkey.from_string(position.mint)
+            try:
+                bonding_curve_pda = derive_bonding_curve_pda(mint)
+                info = await rpc.call(
+                    "getAccountInfo", [str(bonding_curve_pda), {"encoding": "base64"}]
+                )
+                value = info.get("value")
+                if value is None:
+                    logger.warning("bonding curve missing for open position mint=%s", position.mint)
+                    continue
+                raw = base64.b64decode(value["data"][0])
+                curve = decode_bonding_curve(raw)
+            except Exception:
+                logger.exception("failed to refresh curve state for mint=%s", position.mint)
+                continue
+
+            current_price_sol = (
+                spot_price_sol_per_token(curve) * 10**TOKEN_DECIMALS / LAMPORTS_PER_SOL
+            )
+            decision = position.evaluate_exit(current_price_sol, time.monotonic(), exits_cfg)
+            if decision is None:
+                continue
+
+            creator = state.creator_for(position.mint)
+            tokens_to_sell_raw = round(
+                position.tokens_remaining * decision.fraction * 10**TOKEN_DECIMALS
+            )
+            error: str | None = None
+            if creator is None:
+                error = "no creator on record for this mint (position opened before a restart?)"
+            elif tokens_to_sell_raw > 0:
+                try:
+                    error = await _simulate_sell(
+                        rpc, wallet_pubkey, mint, Pubkey.from_string(creator), tokens_to_sell_raw
+                    )
+                except Exception as exc:  # noqa: BLE001 - summarized into the return value, not swallowed
+                    error = f"sell simulation crashed: {exc}"
+
+            if error is not None:
+                logger.warning(
+                    "simulated sell would fail mint=%s reason=%s decision=%s -- "
+                    "leaving position open",
+                    position.mint, error, decision.reason.value,
+                )
+                state.record_failure(failure_limit)
+                continue
+
+            state.record_success()
+            tokens_sold = position.apply_exit(decision)
+            logger.info(
+                "[DRY RUN] simulated sell would succeed mint=%s reason=%s "
+                "tokens_sold=%.2f remaining=%.2f",
+                position.mint, decision.reason.value, tokens_sold, position.tokens_remaining,
+            )
+            heartbeat.record_trade()
+            if position.tokens_remaining <= 0:
+                position_manager.close(position.mint)
+
+
+async def run_reconciliation(settings: Settings, rpc: RpcClient, wallet_pubkey: Pubkey) -> None:
+    interval = settings.config.reconciliation.interval_seconds
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            balance = await rpc.get_balance_sol(str(wallet_pubkey))
+            logger.info(
+                "reconciliation: wallet=%s balance=%.5f SOL credits_spent_today=%d",
+                wallet_pubkey, balance, rpc.credits_spent_today,
+            )
+        except Exception:
+            logger.exception("reconciliation check failed")
+
+
+async def _on_heartbeat(report: HeartbeatReport) -> None:
+    level = logging.WARNING if report.idle_alarm else logging.INFO
+    logger.log(
+        level,
+        "heartbeat tick=%d candidates=%d trades=%d positions_open=%d idle_alarm=%s",
+        report.tick, report.candidates_seen, report.trades_executed,
+        report.positions_open, report.idle_alarm,
+    )
+
+
+async def main() -> None:
+    settings = load_settings()
+    if not settings.secrets.dry_run:
+        raise PreflightError(
+            "DRY_RUN=false, but signing/sending a real transaction is not built "
+            "yet -- see this module's docstring. Set DRY_RUN=true in .env."
+        )
+
+    async with RpcClient(settings) as rpc:
+        wallet_pubkey = await preflight(settings, rpc)
+
+        creator_blocklist = load_creator_blocklist(
+            PROJECT_ROOT / settings.config.filters.creator_blocklist_path
+        )
+        name_symbol_blocklist = load_name_symbol_blocklist(
+            PROJECT_ROOT / settings.config.filters.name_symbol_blocklist_path
+        )
+        tier1_filter = Tier1Filter(
+            settings.config.filters.tier1, creator_blocklist, name_symbol_blocklist
+        )
+
+        queue: asyncio.Queue[Candidate] = asyncio.Queue(maxsize=CANDIDATE_QUEUE_MAXSIZE)
+        listener = MintListener(tier1_filter, queue)
+        position_manager = PositionManager(settings.config.trading.max_concurrent_positions)
+        heartbeat = Heartbeat(settings.config.heartbeat)
+        state = TradingState()
+
+        logger.info(
+            "starting pumpbot: wallet=%s dry_run=%s position_sol=%.4f max_concurrent=%d",
+            wallet_pubkey, settings.secrets.dry_run,
+            settings.config.trading.position_sol, settings.config.trading.max_concurrent_positions,
+        )
+
+        await asyncio.gather(
+            listener.run(),
+            run_trader(settings, rpc, wallet_pubkey, queue, position_manager, heartbeat, state),
+            run_position_monitor(settings, rpc, wallet_pubkey, position_manager, heartbeat, state),
+            run_reconciliation(settings, rpc, wallet_pubkey),
+            heartbeat.run_forever(lambda: position_manager.open_count, _on_heartbeat),
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

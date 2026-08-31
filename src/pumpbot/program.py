@@ -168,6 +168,7 @@ of not smoothing over an unexplained data point.
 from __future__ import annotations
 
 import hashlib
+import random
 
 from solders.pubkey import Pubkey
 
@@ -260,6 +261,59 @@ def derive_associated_token_address(
         ASSOCIATED_TOKEN_PROGRAM_ID,
     )
     return pda
+
+
+# pump.fun's own published fee-recipient rotation pools, fetched from
+# https://raw.githubusercontent.com/pump-fun/pump-public-docs/main/docs/FEE_RECIPIENTS.md
+# on 2026-08-31. Confirmed against live samples: buy/sell account [1] draws
+# from NORMAL+RESERVED (both observed live), account [17]/[15] (buyback)
+# draws only from BUYBACK. These rotate on pump.fun's side periodically --
+# re-fetch and update this list if trades start failing on the fee-recipient
+# account specifically.
+NORMAL_FEE_RECIPIENTS = (
+    "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV",
+    "7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ",
+    "7hTckgnGnLQR6sdH7YkqFTAA7VwTfYFaZ6EhEsU3saCX",
+    "9rPYyANsfQZw3DnDmKE3YCQF5E8oD89UXoHn9JFEhJUz",
+    "AVmoTthdrX6tKt4nDjco2D775W2YK3sDhxPcMmzUAmTY",
+    "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",
+    "FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz",
+    "G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP",
+)
+RESERVED_FEE_RECIPIENTS = (
+    "GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS",
+    "4budycTjhs9fD6xw62VBducVTNgMgJJ5BgtKq7mAZwn6",
+    "8SBKzEQU4nLSzcwF4a74F2iaUDQyTfjGndn6qUWBnrpR",
+    "4UQeTP1T39KZ9Sfxzo3WR5skgsaP6NZa87BAkuazLEKH",
+    "8sNeir4QsLsJdYpc9RZacohhK1Y5FLU3nC5LXgYB4aa6",
+    "Fh9HmeLNUMVCvejxCtCL2DbYaRyBFVJ5xrWkLnMH6fdk",
+    "463MEnMeGyJekNZFQSTUABBEbLnvMTALbT6ZmsxAbAdq",
+    "6AUH3WEHucYZyC61hqpqYUWVto5qA5hjHuNQ32GNnNxA",
+)
+BUYBACK_FEE_RECIPIENTS = (
+    "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
+    "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+    "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL",
+    "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+    "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
+    "EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL",
+    "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD",
+    "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
+)
+
+
+def pick_fee_recipient() -> Pubkey:
+    """Random pick from the combined Normal+Reserved pools -- matches what
+    account [1] actually draws from in every live sample checked."""
+    return Pubkey.from_string(
+        random.choice(NORMAL_FEE_RECIPIENTS + RESERVED_FEE_RECIPIENTS)
+    )
+
+
+def pick_buyback_fee_recipient() -> Pubkey:
+    """Random pick from the Buyback pool -- confirmed distinct from
+    fee_recipient's pools in every live sample checked."""
+    return Pubkey.from_string(random.choice(BUYBACK_FEE_RECIPIENTS))
 
 
 class OrderingNotVerifiedError(RuntimeError):

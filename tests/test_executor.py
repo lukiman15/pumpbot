@@ -1,6 +1,12 @@
+import pytest
 from solders.pubkey import Pubkey
 
-from pumpbot.executor import build_buy_instruction, build_sell_instruction
+from pumpbot.executor import (
+    UnknownTokenProgramError,
+    build_buy_instruction,
+    build_sell_instruction,
+    resolve_token_program_id,
+)
 from pumpbot.program import PUMP_FUN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID
 
 # Real, live-captured buy transaction (signature
@@ -171,3 +177,49 @@ def test_sell_data_uses_sell_discriminator_not_buy():
     data = bytes(ix.data)
     assert data[:8] == SELL_DISCRIMINATOR
     assert data[:8] != BUY_DISCRIMINATOR
+
+
+class _FakeRpc:
+    """Returns None (account not found) for the first `misses` calls, then a
+    real-shaped getAccountInfo response -- simulates the propagation lag a
+    brand-new mint exhibits on a live RPC node, without a real network call.
+    """
+
+    def __init__(self, misses: int, owner: str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"):
+        self.misses = misses
+        self.owner = owner
+        self.calls = 0
+
+    async def call(self, method, params):
+        self.calls += 1
+        if self.calls <= self.misses:
+            return None
+        return {"value": {"owner": self.owner}}
+
+
+@pytest.mark.asyncio
+async def test_resolve_token_program_id_retries_through_transient_misses():
+    rpc = _FakeRpc(misses=2)
+    owner = await resolve_token_program_id(
+        rpc, Pubkey.from_string(REAL_MINT), retries=3, retry_delay_seconds=0
+    )
+    assert str(owner) == str(TOKEN_2022_PROGRAM_ID)
+    assert rpc.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_resolve_token_program_id_raises_after_exhausting_retries():
+    rpc = _FakeRpc(misses=5)
+    with pytest.raises(UnknownTokenProgramError):
+        await resolve_token_program_id(
+            rpc, Pubkey.from_string(REAL_MINT), retries=3, retry_delay_seconds=0
+        )
+    assert rpc.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_resolve_token_program_id_succeeds_immediately_with_no_misses():
+    rpc = _FakeRpc(misses=0)
+    owner = await resolve_token_program_id(rpc, Pubkey.from_string(REAL_MINT))
+    assert str(owner) == str(TOKEN_2022_PROGRAM_ID)
+    assert rpc.calls == 1

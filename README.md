@@ -32,8 +32,31 @@ Read the printed report for:
 
 ## Status
 
-- [x] Scaffold, `config.py`, `rpc.py`, `program.py` (constants + PDAs only)
-- [x] `scripts/probe.py` (Phase 0 gate)
-- [ ] Everything else (`curve.py`, `listener.py`, `filters/tier1.py`,
-      `executor.py`, `positions.py`, `heartbeat.py`, `main.py`) is
-      deliberately not built yet — it depends on Phase 0's output.
+- [x] Scaffold, `config.py`, `rpc.py`, `program.py` (constants, PDAs, and the
+      full verified account ordering for both `buy` and `sell`)
+- [x] `scripts/probe.py` (Phase 0 gate) — passed with a clear GO signal
+- [x] `curve.py`, `listener.py`, `filters/tier1.py`, `positions.py`,
+      `heartbeat.py`, `executor.py`, `main.py` — all built, tested, wired
+- [x] `main.py` runs the full pipeline live in dry-run mode: real mints from
+      PumpPortal, real Tier1 filtering, real bonding-curve sizing, and every
+      buy/sell decision built into a real instruction and checked with
+      `simulateTransaction` (read-only, zero risk — nothing is signed or sent)
+
+## Known blocker: RPC propagation lag
+
+Live dry-run testing surfaced a real infrastructure problem, not a code bug:
+on the QuickNode endpoint currently configured, a brand-new mint's account is
+routinely **not yet visible** via `getAccountInfo` at the moment PumpPortal
+notifies us of it — confirmed systematic (100% of candidates in multiple
+~30-45s live runs), not intermittent. `executor.resolve_token_program_id`
+retries a few times over ~2-3 seconds, but that isn't enough to close the
+gap, and Phase 0's own measured buy-queue rank (median 0) means a sniper
+can't afford to wait it out the way `scripts/probe.py` does (a full 20s)
+without losing all competitiveness anyway.
+
+This is the real remaining blocker before this bot could ever land a
+competitive buy — not the unresolved account slot (see `program.py`), which
+turned out not to matter. Options, none yet evaluated: a faster/geyser-fed
+RPC provider, a different account-visibility strategy (e.g. websocket
+`accountSubscribe`, though that's still bounded by the same node's view of
+the chain), or accepting a slower entry and re-scoping away from "sniping."
