@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+from datetime import date, datetime, timezone
 from typing import Any
 
 import httpx
@@ -53,6 +54,7 @@ class RpcClient:
         self._http = httpx.AsyncClient(timeout=15.0)
         self._id_counter = itertools.count(1)
         self._credits_spent_today = 0
+        self._credits_day: date = datetime.now(timezone.utc).date()
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -63,8 +65,18 @@ class RpcClient:
     async def __aexit__(self, *exc: Any) -> None:
         await self.aclose()
 
+    def _roll_credit_day(self) -> None:
+        # QuickNode resets its own daily cap on its own clock (unknown to us);
+        # UTC midnight is a documented, unambiguous approximation rather than
+        # tying the halt to wherever this process happens to run.
+        today = datetime.now(timezone.utc).date()
+        if today != self._credits_day:
+            self._credits_day = today
+            self._credits_spent_today = 0
+
     @property
     def credits_spent_today(self) -> int:
+        self._roll_credit_day()
         return self._credits_spent_today
 
     def _cost(self, method: str) -> int:
@@ -73,6 +85,7 @@ class RpcClient:
     def _check_credit_budget(self, method: str) -> None:
         if method in CREDIT_EXEMPT_METHODS:
             return
+        self._roll_credit_day()
         halt = self._settings.config.rpc.daily_credit_halt
         if self._credits_spent_today >= halt:
             raise CreditHaltError(
@@ -101,7 +114,6 @@ class RpcClient:
                 except httpx.HTTPError as exc:
                     last_exc = exc
                 else:
-                    self._credits_spent_today += self._cost(method)
                     if resp.status_code == 429:
                         try:
                             body = resp.json()
@@ -120,6 +132,8 @@ class RpcClient:
                         body = resp.json()
                         if "error" in body:
                             raise RpcError(f"{method} -> {body['error']}")
+                        self._roll_credit_day()
+                        self._credits_spent_today += self._cost(method)
                         return body["result"]
 
             backoff = cfg.backoff_base_seconds * (2**attempt)

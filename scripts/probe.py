@@ -138,21 +138,47 @@ async def listen_for_creates(
             backoff = min(max_backoff, backoff * 2)
 
 
+MIN_TX_AGE_S = 20.0
+GET_TX_RETRIES = 4
+GET_TX_RETRY_DELAY_S = 5.0
+
+
 async def resolve_mint_and_rank(rpc: RpcClient, obs: CreateObservation) -> None:
-    """Given a mint+signature from PumpPortal, count buys that beat us to it."""
+    """Given a mint+signature from PumpPortal, count buys that beat us to it.
+
+    A signature this fresh usually isn't indexed yet -- getTransaction returns
+    null for several seconds after the notification arrives. Wait past that
+    window and retry a few times before giving up; otherwise this resolves
+    nothing no matter how long the probe runs.
+    """
     if not obs.signature:
         return
-    try:
-        tx = await rpc.call(
-            "getTransaction",
-            [obs.signature, {"maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}],
-        )
-    except DailyLimitReachedError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - probe is best-effort, log and move on
-        logger.warning("getTransaction failed for %s: %s", obs.signature, exc)
-        return
+
+    wait_for = max(0.0, (obs.notified_at + MIN_TX_AGE_S) - time.monotonic())
+    if wait_for:
+        await asyncio.sleep(wait_for)
+
+    tx = None
+    for attempt in range(GET_TX_RETRIES):
+        try:
+            tx = await rpc.call(
+                "getTransaction",
+                [obs.signature, {"maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}],
+            )
+        except DailyLimitReachedError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - probe is best-effort, log and move on
+            logger.warning("getTransaction failed for %s: %s", obs.signature, exc)
+            return
+        if tx is not None:
+            break
+        if attempt < GET_TX_RETRIES - 1:
+            await asyncio.sleep(GET_TX_RETRY_DELAY_S)
     if tx is None:
+        logger.warning(
+            "getTransaction never resolved for %s after %d attempts",
+            obs.signature, GET_TX_RETRIES,
+        )
         return
 
     block_time = tx.get("blockTime")
@@ -205,10 +231,14 @@ def evaluate_fee_drag(settings, results: ProbeResults) -> None:
     position_sol = settings.config.trading.position_sol
     max_fee_fraction = settings.config.fees.max_fee_fraction
     max_fee_absolute = settings.config.fees.max_fee_absolute_sol
+    priority_fee_ceiling_sol = settings.config.fees.priority_fee_ceiling_sol
     ata_rent_sol = 0.00204
 
     for fee_lamports in results.fee_samples_lamports:
-        priority_fee_sol = fee_lamports / 1_000_000_000
+        # The real executor caps what it actually pays at priority_fee_ceiling_sol;
+        # modeling the raw uncapped sample here would overstate rejections whenever
+        # network fees spike above that ceiling.
+        priority_fee_sol = min(fee_lamports / 1_000_000_000, priority_fee_ceiling_sol)
         est_roundtrip_cost = (
             2 * priority_fee_sol + 0.02 * position_sol + ata_rent_sol * 0.05
         )  # 0.05 = assumed rare-failed-close amortized cost
@@ -261,9 +291,14 @@ async def fetch_recent_buy_accounts(rpc: RpcClient, results: ProbeResults) -> No
                 raise
             except Exception:  # noqa: BLE001
                 continue
+            # The mint's own `create` transaction also invokes the pump.fun
+            # program (self-CPI), so the newest signature isn't necessarily a
+            # buy -- skip the create itself and require a genuinely different
+            # transaction before trusting its account ordering.
             for entry in sigs:
-                sample_sig = entry["signature"]
-                break
+                if entry["signature"] != obs.signature:
+                    sample_sig = entry["signature"]
+                    break
         if sample_sig:
             break
 
@@ -326,15 +361,23 @@ def print_report(results: ProbeResults) -> None:
     print("=" * 60)
 
 
-# Rank resolution costs 2 RPC calls per create. Past this many, keep
-# counting creates (free, from PumpPortal) but stop spending RPC budget on
-# rank -- a few hundred is plenty for a median/rejection-rate estimate, and
-# this is what stands between a normal run and re-exhausting the daily cap.
+# Rank resolution costs up to 2 RPC calls per create (more with getTransaction
+# retries). Past this many, keep counting creates (free, from PumpPortal) but
+# stop spending RPC budget on rank -- a few hundred is plenty for a median/
+# rejection-rate estimate, and this is what stands between a normal run and
+# re-exhausting the daily cap.
 MAX_RANK_RESOLUTIONS = 300
 
+# Each resolution now waits out MIN_TX_AGE_S plus possible retries (up to
+# ~40s), so resolving them one at a time would cap us well under
+# MAX_RANK_RESOLUTIONS in an hour. Run a bounded number concurrently instead.
+RESOLVER_CONCURRENCY = 15
 
-async def main(hours: float) -> None:
+
+async def main(hours: float | None) -> None:
     settings = load_settings()
+    if hours is None:
+        hours = settings.config.probe.default_hours
     results = ProbeResults()
     queue: asyncio.Queue[CreateObservation] = asyncio.Queue()
     daily_limit_hit = asyncio.Event()
@@ -344,19 +387,28 @@ async def main(hours: float) -> None:
             listen_for_creates(settings, results, hours * 3600, queue)
         )
 
+        resolver_tasks: list[asyncio.Task] = []
+
         async def resolver_loop() -> None:
             resolved = 0
+            sem = asyncio.Semaphore(RESOLVER_CONCURRENCY)
+
+            async def run_one(obs: CreateObservation) -> None:
+                async with sem:
+                    try:
+                        await resolve_mint_and_rank(rpc, obs)
+                    except DailyLimitReachedError as exc:
+                        logger.error(
+                            "%s -- halting RPC-based checks for the rest of this run", exc
+                        )
+                        daily_limit_hit.set()
+
             while True:
                 obs = await queue.get()
                 if resolved >= MAX_RANK_RESOLUTIONS or daily_limit_hit.is_set():
                     continue
-                try:
-                    await resolve_mint_and_rank(rpc, obs)
-                except DailyLimitReachedError as exc:
-                    logger.error("%s -- halting RPC-based checks for the rest of this run", exc)
-                    daily_limit_hit.set()
-                    continue
                 resolved += 1
+                resolver_tasks.append(asyncio.create_task(run_one(obs)))
 
         resolver_task = asyncio.create_task(resolver_loop())
 
@@ -376,9 +428,17 @@ async def main(hours: float) -> None:
         fee_task = asyncio.create_task(fee_sampler_loop())
 
         await listener_task
-        # Let in-flight resolutions drain briefly.
-        await asyncio.sleep(3)
+        # Let in-flight resolutions drain -- each can take up to MIN_TX_AGE_S
+        # plus GET_TX_RETRIES * GET_TX_RETRY_DELAY_S (~40s), not the few
+        # seconds a bare RPC round-trip would need.
         resolver_task.cancel()
+        drain_deadline = time.monotonic() + MIN_TX_AGE_S + GET_TX_RETRIES * GET_TX_RETRY_DELAY_S
+        pending = [t for t in resolver_tasks if not t.done()]
+        while pending and time.monotonic() < drain_deadline:
+            await asyncio.sleep(1)
+            pending = [t for t in pending if not t.done()]
+        for t in pending:
+            t.cancel()
         fee_task.cancel()
 
         evaluate_fee_drag(settings, results)
@@ -398,6 +458,6 @@ async def main(hours: float) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 0 gate for pumpbot")
-    parser.add_argument("--hours", type=float, default=1.0)
+    parser.add_argument("--hours", type=float, default=None)
     args = parser.parse_args()
     asyncio.run(main(args.hours))
