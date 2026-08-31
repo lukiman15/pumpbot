@@ -208,6 +208,7 @@ async def resolve_mint_and_rank(rpc: RpcClient, obs: CreateObservation) -> None:
         if entry_block_time is not None and entry_block_time <= block_time + 2:
             buys_before += 1
     obs.buys_before_us = buys_before
+    logger.info("rank resolved mint=%s buys_before=%d", obs.mint, buys_before)
 
 
 async def sample_priority_fees(rpc: RpcClient, results: ProbeResults) -> None:
@@ -221,8 +222,12 @@ async def sample_priority_fees(rpc: RpcClient, results: ProbeResults) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("getRecentPrioritizationFees failed: %s", exc)
         return
-    for s in samples:
-        results.fee_samples_lamports.append(s["prioritizationFee"])
+    fees = [s["prioritizationFee"] for s in samples]
+    results.fee_samples_lamports.extend(fees)
+    # Logged as a batch (one line per ~60s sampling call) rather than one line
+    # per sample -- individually reconstructable from the log, without the
+    # log-volume cost of ~150 lines every call.
+    logger.info("fee_samples batch n=%d values=%s", len(fees), json.dumps(fees))
 
 
 def evaluate_fee_drag(settings, results: ProbeResults) -> None:
