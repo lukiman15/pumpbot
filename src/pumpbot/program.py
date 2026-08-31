@@ -82,14 +82,67 @@ regardless of PumpPortal's `is_mayhem_mode` flag (that correlation was
 checked and is false). Resolve token_program per-mint via getAccountInfo on
 the mint -- never assume either program.
 
-NOT verified: `sell`'s account ordering and instruction data. SELL_DISCRIMINATOR
-is computed the same deterministic way as BUY_DISCRIMINATOR and is very
-likely correct (Anchor discriminators are pure functions of the name
-string), but no live `sell` transaction has been decoded to confirm the
-account list matches `buy`'s (pump.fun's `sell` is commonly assumed
-symmetric with `buy`, but "commonly assumed" is exactly the standard this
-module tries not to rely on). Confirm against a live `sell` before trusting
-executor.py's sell path with real money.
+SELL is NOT symmetric with buy -- this was an assumption in an earlier pass
+and it was WRONG. Confirmed by sampling 13 live mainnet `sell` transactions
+(discriminator-matched the same way as buy) and cross-checking every
+position against the same derivations used for buy:
+
+SELL_ACCOUNTS order (16 accounts, not 18 -- see below):
+  0  global                      -- same as buy
+  1  fee_recipient               -- same rotating pool as buy's [1] (Normal/
+                                     Reserved lists in FEE_RECIPIENTS.md)
+  2  mint
+  3  bonding_curve                -- same as buy
+  4  associated_bonding_curve     -- same as buy
+  5  associated_user              -- same as buy, EXCEPT one sample (of 13)
+                                     where this position held a value that is
+                                     not a valid ATA for the tx's account [6]
+                                     under either token program -- unexplained,
+                                     see note below. 12 of 13 matched cleanly.
+  6  user                        -- same caveat as buy: CPI'd, don't assume
+                                     it equals the outer tx's signer
+  7  system_program               -- same as buy
+  8  creator_vault                -- SWAPPED vs buy: buy has token_program
+                                     here. Confirmed via each mint's bonding
+                                     curve account, which stores the creator
+                                     pubkey at bytes [49:81] (right after the
+                                     8-byte disc + 5 u64 + 1 bool = 49 bytes);
+                                     derive_creator_vault_pda(that creator)
+                                     matched this position in every sample.
+  9  token_program                 -- SWAPPED vs buy: buy has creator_vault
+                                     here. Token-2022 in every sample checked.
+  10 event_authority               -- same as buy
+  11 program                      -- same as buy
+  12 fee_config                   -- shifted up from buy's [14] because sell
+                                     has no volume-accumulator accounts at all
+  13 fee_program                  -- shifted up from buy's [15]
+  14 UNRESOLVED -- the same unresolved account as buy's [16] (not the same
+      VALUE, but the same kind of slot): across samples it's constant for a
+      given (user, mint) pair and varies when either changes, matching buy's
+      characterization exactly. No PDA/ATA hypothesis tried for buy's [16]
+      has been retried against this to actually resolve it -- still opaque,
+      still gated behind a required parameter, do not guess.
+  15 buyback_fee_recipient       -- confirmed against pump.fun's published
+      "Buyback Fee Recipients" list (FEE_RECIPIENTS.md), same role as buy's
+      [17]
+
+sell has NO global_volume_accumulator / user_volume_accumulator accounts --
+this isn't an oversight, it's a real structural difference from buy (16
+accounts total, not 18). Do not add them to a sell instruction.
+
+Instruction data (sell): same 24-byte shape as buy -- 8-byte discriminator +
+u64 amount (LE, tokens in, raw units) + u64 min_sol_output (LE, lamports).
+Confirmed against a live sample that executed successfully with exactly
+this length.
+
+One anomaly: 1 of 13 sampled sells had a position-[5] value that isn't a
+valid associated_user ATA for the tx's account [6] under either token
+program, despite every other position (including the pump.fun-owned
+constants at [10]-[13]) matching cleanly -- so it's genuinely pump.fun's
+sell, not a different program's instruction sharing the discriminator by
+name collision. Root cause not identified; treated as an open question
+rather than folded into the general rule, per this module's standing policy
+of not smoothing over an unexplained data point.
 """
 
 from __future__ import annotations
@@ -131,7 +184,7 @@ def _anchor_discriminator(instruction_name: str) -> bytes:
 
 # CONFIRMED against 6 live buy txs: matched exactly every time.
 BUY_DISCRIMINATOR = _anchor_discriminator("buy")
-# Computed the same deterministic way; NOT yet confirmed against a live `sell`.
+# CONFIRMED against 13 live sell txs: matched exactly every time.
 SELL_DISCRIMINATOR = _anchor_discriminator("sell")
 
 
@@ -207,14 +260,16 @@ def verify() -> None:
     print(f"fee_program                = {FEE_PROGRAM_ID}")
     print(f"fee_config                 = {FEE_CONFIG}")
     print(f"buy discriminator          = {BUY_DISCRIMINATOR.hex()} (confirmed live, 6 samples)")
-    print(f"sell discriminator         = {SELL_DISCRIMINATOR.hex()} (computed, NOT confirmed live)")
+    print(f"sell discriminator         = {SELL_DISCRIMINATOR.hex()} (confirmed live, 13 samples)")
     print()
     print("Confirmed: 17 of buy's 18 accounts (see module docstring). Account")
     print("[16] is NOT resolved -- it doesn't exist on-chain in any sample seen")
     print("and no PDA/ATA hypothesis tried reproduces it. Do not send a live buy")
     print("until it's resolved or explicitly supplied by a caller who has verified it.")
-    print("NOT confirmed: sell's account ordering and instruction data --")
-    print("assumed symmetric with buy, not independently verified against a live tx.")
+    print("Confirmed: sell has its OWN 16-account layout, NOT symmetric with buy --")
+    print("creator_vault/token_program are swapped vs buy, and both volume-")
+    print("accumulator accounts are absent entirely. Its own unresolved slot")
+    print("(position [14]) is the same kind of gap as buy's [16] -- still unsolved.")
 
 
 if __name__ == "__main__":

@@ -7,12 +7,14 @@ transaction (fee payer, recent blockhash, signing, submission, confirmation
 polling per config.yaml's execution.* settings) is a separate, larger piece
 of work not covered here.
 
-Status: 17 of 18 buy accounts are confirmed. Account [16] is NOT --
-see program.py's module docstring for what's been tried and ruled out.
-Both build functions require it as an explicit `unresolved_account_16`
+Status: 17 of 18 buy accounts are confirmed, and sell has its own
+independently-confirmed 16-account layout (NOT symmetric with buy -- see
+program.py's module docstring). Both layouts have one unresolved account
+each (buy's [16], sell's [14] -- same kind of gap, different position and
+value). Both build functions require it as an explicit `unresolved_account`
 parameter with no default, specifically so nothing can call them without
 consciously deciding what to do about it. DO NOT send a live transaction
-built from either function until [16] is resolved.
+built from either function until that gap is resolved.
 
 is_signer/is_writable flags below are inferred from what each account
 plausibly does during a buy (lamports/token balances change -> writable),
@@ -80,8 +82,9 @@ def _encode_buy_data(amount_tokens_raw: int, max_sol_cost_lamports: int) -> byte
 
 
 def _encode_sell_data(amount_tokens_raw: int, min_sol_output_lamports: int) -> bytes:
-    """NOT independently verified -- see program.py's module docstring.
-    Assumed symmetric with buy's (amount, limit) argument shape."""
+    """8-byte discriminator + u64 amount + u64 min_sol_output, 24 bytes total.
+    Confirmed against a live sell sample of exactly this length and shape.
+    See program.py's module docstring."""
     return SELL_DISCRIMINATOR + struct.pack("<QQ", amount_tokens_raw, min_sol_output_lamports)
 
 
@@ -93,7 +96,7 @@ def build_buy_instruction(
     token_program_id: Pubkey,
     fee_recipient: Pubkey,
     buyback_fee_recipient: Pubkey,
-    unresolved_account_16: Pubkey,
+    unresolved_account: Pubkey,
     amount_tokens_raw: int,
     max_sol_cost_lamports: int,
 ) -> Instruction:
@@ -106,13 +109,13 @@ def build_buy_instruction(
     for buyback_fee_recipient) -- an arbitrary address here is not
     confirmed to work and was not what any sampled transaction did.
 
-    unresolved_account_16 is exactly what it says: account [16] in
-    program.py's verified map is NOT resolved (see that module's
+    unresolved_account is exactly what it says: account [16] in
+    program.py's verified buy map is NOT resolved (see that module's
     docstring) -- no PDA/ATA hypothesis tried reproduces the on-chain
     value, which doesn't even exist yet in any sample seen. This parameter
     has no default and no derivation on purpose, so nobody can call this
     function without consciously supplying something for it. DO NOT send a
-    real transaction built from this function until [16] is resolved.
+    real transaction built from this function until it's resolved.
     """
     global_pda = derive_global_pda()
     bonding_curve = derive_bonding_curve_pda(mint)
@@ -142,7 +145,7 @@ def build_buy_instruction(
         AccountMeta(user_volume_accumulator, is_signer=False, is_writable=True),
         AccountMeta(FEE_CONFIG, is_signer=False, is_writable=False),
         AccountMeta(FEE_PROGRAM_ID, is_signer=False, is_writable=False),
-        AccountMeta(unresolved_account_16, is_signer=False, is_writable=True),
+        AccountMeta(unresolved_account, is_signer=False, is_writable=True),
         AccountMeta(buyback_fee_recipient, is_signer=False, is_writable=True),
     ]
 
@@ -161,16 +164,22 @@ def build_sell_instruction(
     token_program_id: Pubkey,
     fee_recipient: Pubkey,
     buyback_fee_recipient: Pubkey,
-    unresolved_account_16: Pubkey,
+    unresolved_account: Pubkey,
     amount_tokens_raw: int,
     min_sol_output_lamports: int,
 ) -> Instruction:
-    """NOT independently verified against a live `sell` transaction -- see
-    program.py's module docstring. Built by assuming the same account
-    ordering as the verified `buy`, which is the common (but here unproven)
-    pump.fun convention. Confirm against a live `sell` before trusting this
-    with real money. See build_buy_instruction's docstring for what
-    unresolved_account_16 means -- it applies here too.
+    """Builds pump.fun's `sell` instruction.
+
+    sell's account layout is NOT symmetric with buy's -- an earlier version
+    of this function assumed it was, and that was wrong. Confirmed against
+    13 live sell transactions (see program.py's module docstring): sell has
+    16 accounts, not 18 (no volume-accumulator accounts at all), and
+    creator_vault/token_program appear in the OPPOSITE order from buy.
+
+    fee_recipient/buyback_fee_recipient and unresolved_account carry the
+    same meaning as in build_buy_instruction -- see that docstring. Note
+    the *values* are not shared between a buy and sell of the same
+    trade; each must be resolved/supplied independently.
     """
     global_pda = derive_global_pda()
     bonding_curve = derive_bonding_curve_pda(mint)
@@ -180,8 +189,6 @@ def build_sell_instruction(
     associated_user = derive_associated_token_address(user, mint, token_program_id)
     creator_vault = derive_creator_vault_pda(creator)
     event_authority = derive_event_authority_pda()
-    global_volume_accumulator = derive_global_volume_accumulator_pda()
-    user_volume_accumulator = derive_user_volume_accumulator_pda(user)
 
     accounts = [
         AccountMeta(global_pda, is_signer=False, is_writable=False),
@@ -192,15 +199,13 @@ def build_sell_instruction(
         AccountMeta(associated_user, is_signer=False, is_writable=True),
         AccountMeta(user, is_signer=True, is_writable=True),
         AccountMeta(SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-        AccountMeta(token_program_id, is_signer=False, is_writable=False),
         AccountMeta(creator_vault, is_signer=False, is_writable=True),
+        AccountMeta(token_program_id, is_signer=False, is_writable=False),
         AccountMeta(event_authority, is_signer=False, is_writable=False),
         AccountMeta(PUMP_FUN_PROGRAM_ID, is_signer=False, is_writable=False),
-        AccountMeta(global_volume_accumulator, is_signer=False, is_writable=True),
-        AccountMeta(user_volume_accumulator, is_signer=False, is_writable=True),
         AccountMeta(FEE_CONFIG, is_signer=False, is_writable=False),
         AccountMeta(FEE_PROGRAM_ID, is_signer=False, is_writable=False),
-        AccountMeta(unresolved_account_16, is_signer=False, is_writable=True),
+        AccountMeta(unresolved_account, is_signer=False, is_writable=True),
         AccountMeta(buyback_fee_recipient, is_signer=False, is_writable=True),
     ]
 
