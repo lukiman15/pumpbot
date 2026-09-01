@@ -72,6 +72,7 @@ class ExecutionConfig(BaseModel):
     skip_preflight: bool
     confirm_poll_interval_seconds: float
     confirm_timeout_seconds: float
+    max_resubmit_attempts: int
     ata_close_max_retries: int
     jito_bundle_enabled: bool
 

@@ -75,6 +75,11 @@ execution:
   skip_preflight: true
   confirm_poll_interval_seconds: 1.0
   confirm_timeout_seconds: 45
+  # A blockhash is valid for ~150 blocks (~60-90s) -- confirm_timeout_seconds
+  # above is comfortably inside that, so this should rarely trigger. When it
+  # does, resubmission is safe: an expired blockhash provably can never land,
+  # so there's no double-send risk (see submit.py's BlockhashExpiredError).
+  max_resubmit_attempts: 2
   ata_close_max_retries: 10
   jito_bundle_enabled: false
 

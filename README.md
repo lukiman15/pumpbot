@@ -39,10 +39,28 @@ single-signer only, since this project is never CPI'd the way the
 historical live samples in `program.py` were), `send_transaction` (real
 `sendTransaction`), `confirm_transaction` (polls `getSignatureStatuses`
 until confirmed, raising `OnChainFailureError` immediately on an on-chain
-error or `ConfirmationTimeoutError` if nothing is ever observed), and
-`send_and_confirm` wiring all four together. Covered by
+error), and `send_and_confirm` wiring it all together. Covered by
 `tests/test_submit.py` against a scripted fake RPC -- no real network call,
 no real funds, in any test.
+
+**Blockhash expiry is handled, not just a timeout.** `confirm_transaction`
+also checks `getBlockHeight` against the blockhash's own
+`lastValidBlockHeight` on every poll. Two genuinely different outcomes when
+a transaction doesn't confirm in time:
+- `BlockhashExpiredError` -- the cluster has moved past
+  `lastValidBlockHeight` with no status ever observed. Solana's runtime
+  rejects any transaction referencing an expired blockhash before
+  execution, so this signature is now *provably* dead — it can never land,
+  no matter how long anyone waits. `send_and_confirm` resubmits
+  automatically with a fresh blockhash when this happens
+  (`execution.max_resubmit_attempts`, default 2), and this is the *only*
+  condition where resubmitting is safe: there's no window where both the
+  expired and the new submission could land and double-execute the trade.
+- `ConfirmationTimeoutError` -- the poll deadline passed but the blockhash
+  is still technically valid. The original transaction could still land at
+  any moment, so `send_and_confirm` does **not** resubmit here — doing so
+  would risk a double-send if both eventually land. This surfaces to the
+  caller for reconciliation instead.
 
 This is a genuinely different kind of action from everything else in this
 repo: everywhere else, `simulateTransaction` is read-only and nothing is
@@ -57,12 +75,8 @@ Still needed before that wiring makes sense:
 - ATA lifecycle: `submit.py` doesn't yet decide *when* to close a position's
   ATA after a full exit (rent recovery) -- that's a `main.py`-level policy
   question, not a `submit.py` one.
-- Blockhash-expiry handling: `send_and_confirm` currently just waits out
-  `confirm_timeout_seconds`; it doesn't yet check `lastValidBlockHeight` to
-  know when a transaction can no longer land at all (vs. hasn't landed
-  *yet*) and decide whether to resubmit with a fresh blockhash.
 - Real integration into `run_trader`/`run_position_monitor` in place of the
-  `_simulate` calls, once the two items above exist.
+  `_simulate` calls, once the item above exists.
 
 ## Status
 
