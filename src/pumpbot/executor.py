@@ -9,19 +9,20 @@ of work not covered here.
 
 Status: all 18 of buy's accounts are confirmed, including [16] -- resolved
 as bonding_curve_v2 (see program.py's module docstring). Sell has its own
-independently-confirmed 16-account layout (NOT symmetric with buy). Sell's
-[14] is the one remaining gap: its identity is still unknown (no PDA/ATA
-hypothesis reproduces it), but it's confirmed UNVALIDATED by live
-simulateTransaction against brand-new mints (two independent samples, a
-random pubkey both times) -- the on-chain program never checks it, unlike
-buy's [16] which does raise InvalidBondingCurveV2 when wrong. Both build
-functions still require their unresolved_account as an explicit parameter
-with no default -- not because an arbitrary value is risky for sell (it's
-confirmed not to be) but because a future program upgrade could start
-validating it, and a silent default would hide that when it happens.
-simulateTransaction is not the same as an actual send, though -- run every
-transaction through simulateTransaction immediately before sending until
-an actual live send has removed all doubt.
+independently-confirmed 16-account layout (NOT symmetric with buy),
+including [14] -- also resolved as bonding_curve_v2, the SAME formula as
+buy's [16]. This corrects a real mistake, not just a superseded caveat: an
+earlier pass concluded [14] was "confirmed unvalidated" from two brand-new
+mints tested at t=0, then a real held position hit InvalidBondingCurveV2
+(Custom 6074) once its mint had aged past creation -- the same check
+buy's [16] has, just not triggered by the earlier narrow test condition.
+Both build functions still require their unresolved_account as an
+explicit parameter with no default -- this project's own history (twice
+now, [16] then [14]) shows a silent "safe" default would have hidden a
+real validation change instead of surfacing it. simulateTransaction is
+not the same as an actual send, though -- run every transaction through
+simulateTransaction immediately before sending until an actual live send
+has removed all doubt.
 
 is_signer/is_writable flags below are inferred from what each account
 plausibly does during a buy (lamports/token balances change -> writable),
@@ -223,15 +224,16 @@ def build_sell_instruction(
     shared between a buy and sell of the same trade; each must be
     resolved/supplied independently.
 
-    unresolved_account (position [14]) is DIFFERENT from buy's [16] in one
-    important way: buy's slot is validated by the on-chain program (wrong
-    value raises InvalidBondingCurveV2) and has a known identity
-    (bonding_curve_v2). Sell's slot's identity is still unknown -- no PDA/
-    ATA hypothesis reproduces it -- but is confirmed UNVALIDATED: two
-    independent live simulateTransaction samples against brand-new mints,
-    each with a random unrelated pubkey here, ran straight past this slot
-    into real business logic with no error referencing it at all. Safe to
-    submit any value. See program.py's module docstring for the full
+    unresolved_account (position [14]) is the SAME as buy's [16]:
+    bonding_curve_v2, derived with derive_bonding_curve_v2_pda(mint). An
+    earlier version of this docstring claimed this slot was "confirmed
+    unvalidated" -- that was tested only against brand-new mints at
+    creation and did not hold in general: a real held position hit
+    InvalidBondingCurveV2 (Custom 6074) here once its mint had aged past
+    creation, resolved by passing the real bonding_curve_v2 PDA instead of
+    an arbitrary value (confirmed live: err: null with it, Custom 6074
+    without). Callers must pass derive_bonding_curve_v2_pda(mint) here, not
+    an arbitrary value -- see program.py's module docstring for the full
     account map and how this was confirmed.
     """
     global_pda = derive_global_pda()

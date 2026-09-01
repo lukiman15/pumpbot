@@ -187,6 +187,37 @@ No RPC provider change was needed in the end; the constant-k trial was
 useful for isolating the cause (ruling out "bad node") but the actual fix
 was two lines of request parameters.
 
+## Real-money bug found and fixed: sell needs bonding_curve_v2 too
+
+The first-ever real live trade (2026-08-31, `0.001 SOL` position) surfaced
+a genuine bug: the position's sell kept failing simulation with
+`InvalidBondingCurveV2` (`Custom: 6074`) once its mint had aged a few
+minutes past creation, tripping the failsafe halt. Root cause: an earlier
+pass had concluded sell's account `[14]` was "confirmed unvalidated" by
+the on-chain program — but that conclusion was only ever tested against
+brand-new mints at the moment of creation (two samples, both at t=0). It
+did not hold in general. A real, currently-open position's mint had
+progressed past creation with real trading activity, and pump.fun's `Sell`
+instruction enforced the exact same `bonding_curve_v2` check buy's `[16]`
+has — the earlier tests simply never ran under a condition that would
+trigger it.
+
+Confirmed and fixed via live `simulateTransaction` against the actual
+stuck position: `Custom 6074` with an arbitrary value, `err: null` (full
+success) with `derive_bonding_curve_v2_pda(mint)` — the same formula as
+buy's `[16]`. `main.py`'s `_build_sell` now uses it. No funds were lost —
+simulation caught every bad attempt before anything was signed or sent;
+the position was simply stuck in a harmless retry loop until this fix
+landed.
+
+**The lesson, in the project's own terms:** "confirmed" always means
+confirmed *under a specific tested condition*, and generalizing from
+"true at mint creation" to "true always" is exactly the kind of
+single-sample trust the project's standing rule warns against — this
+just happened at the level of a *condition* (mint age) rather than a
+single value. See `program.py`'s module docstring on account `[14]` for
+the full account of what was tested versus what was true.
+
 ## Resolved: slippage tolerance, and buy's mystery account [16]
 
 `config.yaml` now has `trading.slippage_tolerance_fraction` (default 5%),

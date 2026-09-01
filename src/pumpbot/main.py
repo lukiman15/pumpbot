@@ -311,11 +311,15 @@ def _build_sell(
         token_program_id=token_program_id,
         fee_recipient=pick_fee_recipient(),
         buyback_fee_recipient=pick_buyback_fee_recipient(),
-        # Identity still unknown, but confirmed UNVALIDATED by the current
-        # on-chain program via live simulateTransaction against brand-new
-        # mints (two independent samples) -- see program.py's module
-        # docstring on account [14]. Safe to pass any value.
-        unresolved_account=wallet_pubkey,
+        # CORRECTED (see program.py's module docstring on account [14]):
+        # the earlier "confirmed unvalidated" conclusion was tested only
+        # against brand-new mints at t=0 and did NOT hold -- a live position
+        # (mint progressed past creation, real trading activity) hit
+        # InvalidBondingCurveV2 (Custom 6074) with an arbitrary value here,
+        # exactly the same check buy's [16] has. Using the same derivation
+        # as buy resolved it (confirmed via live simulateTransaction:
+        # err: null with this value, Custom 6074 with any other).
+        unresolved_account=derive_bonding_curve_v2_pda(mint),
         amount_tokens_raw=tokens_raw,
         min_sol_output_lamports=min_sol_output_lamports,
     )

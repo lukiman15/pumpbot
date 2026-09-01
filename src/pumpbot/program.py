@@ -71,11 +71,17 @@ BUY_ACCOUNTS order (index: name -- how it was confirmed):
       InvalidBondingCurveV2 check entirely and proceeds into pump.fun's
       real Buy logic (observed failing further downstream on fee_recipient
       authorization instead -- a different, separately-tracked problem,
-      see executor.py). NOT yet confirmed for sell: the same seed formula
-      does NOT reproduce sell's account [14] from this module's committed
-      historical sell sample (a real mismatch, not just unverified) --
-      sell's remaining-account slot is evidently something else, or seeded
-      differently, and is intentionally left unresolved rather than guessed.
+      see executor.py). Sell's account [14] uses this SAME formula for any
+      currently-active mint (see below) -- but this module's one committed
+      historical sell sample genuinely does NOT match it. That mismatch is
+      real, not a bug in the derivation: that sample's mint predates
+      whatever pump.fun rolled out to start enforcing this check, the same
+      way an early buy test against an already-established mint didn't
+      trigger InvalidBondingCurveV2 either. Don't treat that one old
+      sample as evidence against using derive_bonding_curve_v2_pda for a
+      live sell -- it's the reverse: a live, currently-open position's
+      real sell simulation confirmed err: null with this exact derivation
+      and Custom 6074 without it (see [14] below).
   17 buyback_fee_recipient       -- CONFIRMED DISTINCT from [1]'s fee_recipient
       (they vary independently across samples, including staying different
       when [1] repeats) -- every observed value matched pump.fun's published
@@ -141,27 +147,30 @@ SELL_ACCOUNTS order (16 accounts, not 18 -- see below):
   12 fee_config                   -- shifted up from buy's [14] because sell
                                      has no volume-accumulator accounts at all
   13 fee_program                  -- shifted up from buy's [15]
-  14 UNKNOWN IDENTITY, CONFIRMED UNVALIDATED -- unlike buy's [16], this slot's
-      real identity is still not known (no PDA/ATA hypothesis reproduces this
-      module's committed historical sell sample's value -- ~10 hypotheses
-      tried and exhausted, including every seed combination of mint/user/
-      creator against both derive_bonding_curve_v2_pda's exact formula and
-      plausible per-(user,mint) variants). What IS now confirmed, closing
-      the caveat from the previous pass: a completely random, freshly
-      generated pubkey placed in this slot on a live sell simulation against
-      a BRAND-NEW mint (not an already-established one, which is what the
-      old, now-superseded test used) runs straight past this slot with no
-      error and proceeds into pump.fun's real business logic
-      (`NotEnoughTokensToSell`, Custom 6023 -- the genuine balance check).
-      Confirmed twice independently: two different brand-new mints, two
-      different random pubkeys, both times sailing past [14] with zero
-      validation. This is the same technique that resolved buy's [16] (force
-      an error and read what pump.fun's own program says) -- the difference
-      is buy's program DOES validate its slot (raises InvalidBondingCurveV2
-      when wrong) and sell's does NOT, so sell's real error surfaces past it
-      instead of naming this slot. Safe to submit an arbitrary value here on
-      a real send -- verified against brand-new mints specifically, not just
-      inherited from the old established-mint test.
+  14 RESOLVED -- bonding_curve_v2, same as buy's [16]:
+      derive_bonding_curve_v2_pda(mint), seeds [b"bonding-curve-v2", mint].
+      This corrects a real, live-caught mistake, not just a superseded
+      caveat. An earlier pass concluded this slot was "confirmed
+      unvalidated" -- an arbitrary pubkey ran past it cleanly on two
+      brand-new mints tested immediately at creation. That conclusion was
+      WRONG in general: a real held position, once its mint had progressed
+      past creation (a few minutes and real trading activity later), hit
+      pump.fun's `InvalidBondingCurveV2` (Custom 6074) on every sell
+      attempt with an arbitrary value here -- the exact same check buy's
+      [16] has, just not yet triggered by the earlier tests' narrow
+      condition (brand-new mint, t=0). Confirmed via live
+      simulateTransaction against that actual live position: `Custom 6074`
+      with an arbitrary value or the wrong creator, `err: null` (full
+      success into real business logic) with derive_bonding_curve_v2_pda
+      and the correct creator. The earlier "unvalidated" tests weren't
+      false, they were incomplete -- they never tested a mint old/active
+      enough for pump.fun to start enforcing this check, and generalized
+      from "true at t=0" to "true always" without re-testing.
+      **How to apply:** this is why the project's own standing rule says
+      to distrust "confirmed safe" claims that were only checked under one
+      narrow condition (see this module's docstring's opening paragraph on
+      account [16]) -- always ask what condition a confirmation was tested
+      under, not just whether it was tested.
   15 buyback_fee_recipient       -- confirmed against pump.fun's published
       "Buyback Fee Recipients" list (FEE_RECIPIENTS.md), same role as buy's
       [17]
@@ -383,10 +392,12 @@ def verify() -> None:
     print("Confirmed: all 18 of buy's accounts, including [16] -- resolved as")
     print("bonding_curve_v2 (derive_bonding_curve_v2_pda), verified against a")
     print("committed historical sample AND live simulateTransaction on two")
-    print("brand-new mints. 15-16 of sell's 16 accounts confirmed (see module")
-    print("docstring); sell's [14] identity remains unknown, but is confirmed")
-    print("UNVALIDATED on brand-new mints (two independent live simulate")
-    print("samples with a random pubkey both sailed past it with zero error).")
+    print("brand-new mints. All 16 of sell's accounts are now confirmed too,")
+    print("including [14] -- RESOLVED as the same bonding_curve_v2 formula as")
+    print("buy's [16] (corrects an earlier 'confirmed unvalidated' claim that")
+    print("was only ever tested against brand-new mints; a live position's")
+    print("real sell hit InvalidBondingCurveV2 once its mint had aged, and")
+    print("using derive_bonding_curve_v2_pda fixed it -- see module docstring).")
     print("Sell is NOT symmetric with buy: creator_vault/token_program are")
     print("swapped, and sell has no volume-accumulator accounts at all (16 vs 18).")
     print()
