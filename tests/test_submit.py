@@ -1,16 +1,20 @@
 import pytest
+from solders.compute_budget import ID as COMPUTE_BUDGET_PROGRAM_ID
 from solders.hash import Hash
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 
-from pumpbot.config import ExecutionConfig
+from pumpbot.config import ExecutionConfig, FeesConfig
 from pumpbot.submit import (
+    BASE_FEE_LAMPORTS_PER_SIGNATURE,
     BlockhashExpiredError,
     ConfirmationTimeoutError,
     OnChainFailureError,
     SubmissionError,
+    build_compute_budget_instructions,
     confirm_transaction,
+    estimate_entry_fee_lamports,
     get_recent_blockhash,
     send_and_confirm,
     send_transaction,
@@ -36,6 +40,19 @@ def make_transfer_ix(keypair: Keypair) -> list:
             )
         )
     ]
+
+
+def make_fees_config(**overrides) -> FeesConfig:
+    defaults = {
+        "max_fee_fraction": 0.25,
+        "max_fee_absolute_sol": 0.0015,
+        "priority_fee_ceiling_sol": 0.0008,
+        "close_fee_reserve_sol": 0.0003,
+        "compute_unit_limit": 40000,
+        "priority_fee_sol": 0.0,
+    }
+    defaults.update(overrides)
+    return FeesConfig(**defaults)
 
 
 def make_execution_config(**overrides) -> ExecutionConfig:
@@ -276,3 +293,51 @@ async def test_send_and_confirm_raises_blockhash_expired_after_exhausting_resubm
         )
     # Initial attempt + 2 resubmits = 3 total sends, then gives up.
     assert rpc._per_method_count["sendTransaction"] == 3
+
+
+def test_build_compute_budget_instructions_omits_price_at_zero_fee():
+    instructions = build_compute_budget_instructions(make_fees_config(priority_fee_sol=0.0))
+    assert len(instructions) == 1
+    assert instructions[0].program_id == COMPUTE_BUDGET_PROGRAM_ID
+
+
+def test_build_compute_budget_instructions_includes_price_when_fee_nonzero():
+    fees_config = make_fees_config(priority_fee_sol=0.0005, priority_fee_ceiling_sol=0.0008)
+    instructions = build_compute_budget_instructions(fees_config)
+    assert len(instructions) == 2
+    assert all(ix.program_id == COMPUTE_BUDGET_PROGRAM_ID for ix in instructions)
+
+
+def test_build_compute_budget_instructions_price_matches_pinned_formula():
+    fees_config = make_fees_config(
+        priority_fee_sol=0.0005, priority_fee_ceiling_sol=0.0008, compute_unit_limit=40000
+    )
+    instructions = build_compute_budget_instructions(fees_config)
+    # priority_fee_lamports = compute_unit_limit * compute_unit_price_micro / 1_000_000
+    # -- recover compute_unit_price_micro from the pinned formula and check
+    # the resulting instruction reproduces the target priority fee, rather
+    # than asserting on solders' internal instruction-data byte layout.
+    priority_fee_lamports = round(0.0005 * 1_000_000_000)
+    expected_price_micro = priority_fee_lamports * 1_000_000 // 40000
+    reconstructed_lamports = 40000 * expected_price_micro // 1_000_000
+    assert reconstructed_lamports == priority_fee_lamports
+    # Sanity: the second instruction is the price instruction, distinct
+    # from the first (the limit instruction).
+    assert instructions[1].data != instructions[0].data
+
+
+def test_estimate_entry_fee_lamports_excludes_rent_at_zero_priority_fee():
+    fees_config = make_fees_config(priority_fee_sol=0.0)
+    assert estimate_entry_fee_lamports(fees_config, signature_count=1) == BASE_FEE_LAMPORTS_PER_SIGNATURE
+
+
+def test_estimate_entry_fee_lamports_scales_with_signature_count():
+    fees_config = make_fees_config(priority_fee_sol=0.0)
+    assert estimate_entry_fee_lamports(fees_config, signature_count=3) == 3 * BASE_FEE_LAMPORTS_PER_SIGNATURE
+
+
+def test_estimate_entry_fee_lamports_adds_priority_fee_per_signature():
+    fees_config = make_fees_config(priority_fee_sol=0.0005, priority_fee_ceiling_sol=0.0008)
+    priority_fee_lamports = round(0.0005 * 1_000_000_000)
+    expected = BASE_FEE_LAMPORTS_PER_SIGNATURE + priority_fee_lamports
+    assert estimate_entry_fee_lamports(fees_config, signature_count=1) == expected

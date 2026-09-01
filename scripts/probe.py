@@ -240,9 +240,13 @@ def evaluate_fee_drag(settings, results: ProbeResults) -> None:
     ata_rent_sol = 0.00204
 
     for fee_lamports in results.fee_samples_lamports:
-        # The real executor caps what it actually pays at priority_fee_ceiling_sol;
-        # modeling the raw uncapped sample here would overstate rejections whenever
-        # network fees spike above that ceiling.
+        # NOTE: the real executor does NOT dynamically bid the network's
+        # observed priority fee -- it pays a fixed, operator-configured
+        # fees.priority_fee_sol (0.0 by default; see submit.py's
+        # build_compute_budget_instructions and MILESTONE-3-HANDOFF.md).
+        # This clamp models a hypothetical future dynamic-bidding strategy
+        # capped at priority_fee_ceiling_sol, purely to estimate what fee
+        # drag *would* look like under one -- not what's paid today.
         priority_fee_sol = min(fee_lamports / 1_000_000_000, priority_fee_ceiling_sol)
         est_roundtrip_cost = (
             2 * priority_fee_sol + 0.02 * position_sol + ata_rent_sol * 0.05

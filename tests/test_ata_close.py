@@ -4,7 +4,7 @@ from solders.keypair import Keypair
 
 import pumpbot.ata_close as ata_close
 from pumpbot.ata_close import close_ata_after_exit, get_token_account_balance_raw
-from pumpbot.config import ExecutionConfig
+from pumpbot.config import ExecutionConfig, FeesConfig
 from pumpbot.program import TOKEN_2022_PROGRAM_ID, derive_associated_token_address
 
 
@@ -33,6 +33,19 @@ def make_execution_config(**overrides) -> ExecutionConfig:
     )
     defaults.update(overrides)
     return ExecutionConfig(**defaults)
+
+
+def make_fees_config(**overrides) -> FeesConfig:
+    defaults = {
+        "max_fee_fraction": 0.25,
+        "max_fee_absolute_sol": 0.0015,
+        "priority_fee_ceiling_sol": 0.0008,
+        "close_fee_reserve_sol": 0.0003,
+        "compute_unit_limit": 40000,
+        "priority_fee_sol": 0.0,
+    }
+    defaults.update(overrides)
+    return FeesConfig(**defaults)
 
 
 class _FakeRpc:
@@ -90,7 +103,8 @@ async def test_get_token_account_balance_raw_returns_amount_when_present():
 async def test_close_ata_after_exit_returns_none_when_already_closed():
     rpc = _FakeRpc({"getAccountInfo": account_missing()})
     result = await close_ata_after_exit(
-        rpc, TEST_KEYPAIR, MINT, TOKEN_2022_PROGRAM_ID, make_execution_config()
+        rpc, TEST_KEYPAIR, MINT, TOKEN_2022_PROGRAM_ID, make_execution_config(),
+        make_fees_config(),
     )
     assert result is None
 
@@ -107,7 +121,8 @@ async def test_close_ata_after_exit_closes_immediately_when_balance_zero():
         }
     )
     result = await close_ata_after_exit(
-        rpc, TEST_KEYPAIR, MINT, TOKEN_2022_PROGRAM_ID, make_execution_config()
+        rpc, TEST_KEYPAIR, MINT, TOKEN_2022_PROGRAM_ID, make_execution_config(),
+        make_fees_config(),
     )
     assert result == FAKE_SIGNATURE
     assert rpc.count("sendTransaction") == 1
@@ -133,6 +148,7 @@ async def test_close_ata_after_exit_retries_until_balance_reaches_zero():
         MINT,
         TOKEN_2022_PROGRAM_ID,
         make_execution_config(ata_close_max_retries=5),
+        make_fees_config(),
     )
     assert result == FAKE_SIGNATURE
     assert rpc.count("getTokenAccountBalance") == 3
@@ -153,6 +169,7 @@ async def test_close_ata_after_exit_gives_up_quietly_when_balance_never_zero():
         MINT,
         TOKEN_2022_PROGRAM_ID,
         make_execution_config(ata_close_max_retries=3),
+        make_fees_config(),
     )
     assert result is None  # never raises -- rent forfeited, not fund-unsafe
     assert rpc.count("getTokenAccountBalance") == 3
@@ -179,6 +196,7 @@ async def test_close_ata_after_exit_gives_up_quietly_when_send_keeps_failing():
         MINT,
         TOKEN_2022_PROGRAM_ID,
         make_execution_config(ata_close_max_retries=2, confirm_timeout_seconds=0),
+        make_fees_config(),
     )
     assert result is None
     assert rpc.count("sendTransaction") == 2

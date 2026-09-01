@@ -30,16 +30,23 @@ import base64
 import logging
 import time
 
+from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 from solders.hash import Hash
 from solders.instruction import Instruction
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import Transaction
 
-from pumpbot.config import ExecutionConfig
+from pumpbot.config import ExecutionConfig, FeesConfig
+from pumpbot.curve import LAMPORTS_PER_SOL
 from pumpbot.rpc import RpcClient
 
 logger = logging.getLogger(__name__)
+
+# Solana's flat per-signature fee. This project has exactly one signer per
+# transaction (see sign_transaction's docstring), so this is also the
+# per-transaction base fee.
+BASE_FEE_LAMPORTS_PER_SIGNATURE = 5000
 
 
 class SubmissionError(RuntimeError):
@@ -100,6 +107,51 @@ class BlockhashExpiredError(RuntimeError):
             "this signature can never land, safe to resubmit"
         )
         self.signature = signature
+
+
+def estimate_entry_fee_lamports(fees_config: FeesConfig, signature_count: int) -> int:
+    """Base fee + priority fee for `signature_count` transactions --
+    EXCLUDING ATA rent (see MILESTONE-3-HANDOFF.md Section 5.3). Rent is
+    paid in the buy leg and recovered in the ATA-close leg -- it's float,
+    not a cost, and a fee gate that counted it would reject nearly every
+    trade at a small position size while looking like a working filter.
+
+    Used by main.py's fee gate to estimate the cost of a single entry
+    (signature_count=1, one bundled create-ATA+buy transaction)."""
+    base_fee_lamports = signature_count * BASE_FEE_LAMPORTS_PER_SIGNATURE
+    priority_fee_per_tx_lamports = round(fees_config.priority_fee_sol * LAMPORTS_PER_SOL)
+    return base_fee_lamports + signature_count * priority_fee_per_tx_lamports
+
+
+def build_compute_budget_instructions(fees_config: FeesConfig) -> list[Instruction]:
+    """Returns the ComputeBudget instructions to prepend to every
+    transaction (buy, sell, and ATA close alike) -- see
+    MILESTONE-3-HANDOFF.md Section 5.1/5.2.
+
+    Always includes SetComputeUnitLimit: an explicit, tight limit is free
+    and improves scheduling versus the default 200,000-CU-per-instruction
+    assumption, independent of whether a priority fee is paid at all.
+
+    SetComputeUnitPrice is included only when fees_config.priority_fee_sol
+    is nonzero -- 0.0 is this project's deliberate default (it has
+    explicitly dropped the latency race; paying for faster inclusion buys
+    nothing strategically yet), so the common case emits one instruction,
+    not two.
+
+    The two ComputeBudget values are related by:
+        priority_fee_lamports = compute_unit_limit * compute_unit_price_micro / 1_000_000
+    so achieving a target priority_fee_sol at a fixed compute_unit_limit
+    means solving for the price:
+        compute_unit_price_micro = priority_fee_lamports * 1_000_000 // compute_unit_limit
+    """
+    instructions = [set_compute_unit_limit(fees_config.compute_unit_limit)]
+    if fees_config.priority_fee_sol > 0.0:
+        priority_fee_lamports = round(fees_config.priority_fee_sol * LAMPORTS_PER_SOL)
+        compute_unit_price_micro = (
+            priority_fee_lamports * 1_000_000 // fees_config.compute_unit_limit
+        )
+        instructions.append(set_compute_unit_price(compute_unit_price_micro))
+    return instructions
 
 
 async def get_recent_blockhash(rpc: RpcClient) -> tuple[Hash, int]:

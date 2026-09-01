@@ -32,8 +32,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from pumpbot.config import PROJECT_ROOT
+from pumpbot.config import PROJECT_ROOT, load_settings
 from pumpbot.ledger import read_events
+from pumpbot.submit import BASE_FEE_LAMPORTS_PER_SIGNATURE
 
 MIN_SAMPLE_FOR_STATS = 30
 
@@ -294,6 +295,36 @@ def tier2_outcome_report(events: list[dict[str, Any]]) -> dict[str, dict[str, An
     return report
 
 
+def fee_composition(trades: list[ClosedRealTrade]) -> dict[str, Any]:
+    """Splits total_fee_lamports into a modeled base-fee component
+    (BASE_FEE_LAMPORTS_PER_SIGNATURE * leg_count, mirroring submit.py's
+    estimate_entry_fee_lamports) and a priority-fee residual -- the ledger
+    only records the real total paid, not the two components separately,
+    so this is a model over that figure, not an independently-recorded
+    one. Reports rent recovered alongside it, and fee drag both including
+    and excluding that recovery."""
+    n = len(trades)
+    if n == 0:
+        return {"n": 0}
+    base_fee_total = sum(t.leg_count * BASE_FEE_LAMPORTS_PER_SIGNATURE for t in trades)
+    total_fee_total = sum(t.total_fee_lamports for t in trades)
+    priority_fee_total = max(0, total_fee_total - base_fee_total)
+    rent_recovered_total = sum(t.rent_recovered_lamports for t in trades)
+    turnover_total = sum(t.gross_turnover_lamports for t in trades)
+    drag_excluding_rent = total_fee_total / turnover_total if turnover_total else None
+    drag_including_rent = (
+        (total_fee_total - rent_recovered_total) / turnover_total if turnover_total else None
+    )
+    return {
+        "n": n,
+        "base_fee_total": base_fee_total,
+        "priority_fee_total": priority_fee_total,
+        "rent_recovered_total": rent_recovered_total,
+        "drag_excluding_rent": drag_excluding_rent,
+        "drag_including_rent": drag_including_rent,
+    }
+
+
 # --- printing --------------------------------------------------------------
 
 
@@ -393,6 +424,49 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
             )
 
     print()
+    print("=== Fee composition (CLOSED real trades) ===")
+    composition = fee_composition(closed_trades)
+    if composition["n"] == 0:
+        print("  n/a (n=0)")
+    else:
+        n = composition["n"]
+        print(f"  base_fee (modeled): {_fmt_lamports(composition['base_fee_total'])} (n={n})")
+        print(f"  priority_fee (modeled residual): {_fmt_lamports(composition['priority_fee_total'])} (n={n})")
+        print(f"  rent_recovered: {_fmt_lamports(composition['rent_recovered_total'])} (n={n})")
+        drag_ex = composition["drag_excluding_rent"]
+        drag_in = composition["drag_including_rent"]
+        drag_ex_str = f"{drag_ex:.2%}" if drag_ex is not None else "n/a"
+        drag_in_str = f"{drag_in:.2%}" if drag_in is not None else "n/a"
+        print(f"  fee_drag excluding rent recovery: {drag_ex_str} (n={n})")
+        print(f"  fee_drag including rent recovery: {drag_in_str} (n={n})")
+
+    print()
+    print("=== Sizing readiness ===")
+    settings = load_settings()
+    position_sol = settings.config.trading.position_sol
+    baseline_position_sol = settings.config.trading.baseline_position_sol
+    threshold = settings.config.trading.min_closed_trades_before_sizeup
+    real_closed = len(closed_trades)
+    print(f"  real closed trades: {real_closed} (threshold: {threshold})")
+    if position_sol <= baseline_position_sol:
+        print(
+            f"  position_sol={position_sol:.4f} is at or below "
+            f"baseline_position_sol={baseline_position_sol:.4f} -- sizing "
+            "discipline not in play"
+        )
+    elif real_closed >= threshold:
+        print(
+            f"  position_sol={position_sol:.4f} exceeds baseline -- "
+            f"DATA-SUPPORTED ({real_closed}>={threshold} real closed trades)"
+        )
+    else:
+        print(
+            f"  position_sol={position_sol:.4f} exceeds baseline -- "
+            f"NOT DATA-SUPPORTED ({real_closed}<{threshold} real closed trades, "
+            "expectancy at this size is unmeasured)"
+        )
+
+    print()
     print("=== Adverse selection: median forward return by arm ===")
     by_arm = adverse_selection_by_arm(all_events)
     if not by_arm:
@@ -417,8 +491,6 @@ def main() -> None:
     if args.ledger is not None:
         ledger_path = Path(args.ledger)
     else:
-        from pumpbot.config import load_settings
-
         settings = load_settings()
         ledger_path = PROJECT_ROOT / settings.config.ledger.path
 

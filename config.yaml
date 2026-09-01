@@ -19,16 +19,43 @@ trading:
   # slippage-protection error (Custom 6000/6002) on live buy simulations -- see
   # README.md.
   slippage_tolerance_fraction: 0.05
+  # Sizing-discipline guard, checked at startup against the ledger's real
+  # closed-trade count (MILESTONE-3-HANDOFF.md Section 5.6). Warns loudly
+  # (CRITICAL) rather than refusing to start -- it's the operator's money
+  # and their call, not a config file's to gatekeep.
+  baseline_position_sol: 0.001
+  min_closed_trades_before_sizeup: 30
 
 fees:
-  # est_roundtrip_cost / position_sol threshold. Fractional ceiling.
+  # (base fee + priority fee) / position_sol threshold. Fractional ceiling.
+  # Deliberately excludes ATA rent -- rent is paid in the buy leg and
+  # recovered in the ATA-close leg (float, not a cost); counting it here
+  # would reject nearly every trade at a small position size while looking
+  # like a working filter. See main.py's fee gate / estimate_entry_fee_lamports.
   max_fee_fraction: 0.25
   # Absolute ceiling in SOL, independent of the fraction above — at this wallet size a
   # percentage alone permits fees that are large relative to the whole wallet.
+  # Also excludes ATA rent, same reasoning as max_fee_fraction above.
   max_fee_absolute_sol: 0.0015
+  # Enforced maximum for priority_fee_sol below -- config load fails if
+  # priority_fee_sol exceeds this. Currently unreachable since
+  # priority_fee_sol is 0.0, but it's the real ceiling once that changes.
   priority_fee_ceiling_sol: 0.0008
   # Reserved per open position so a pending ATA close is never left unpayable.
   close_fee_reserve_sol: 0.0003
+  # Explicit compute-unit limit for every transaction (buy, sell, ATA
+  # close) -- free, and tighter scheduling than the default
+  # 200,000-CU-per-instruction assumption. Pump.fun's buy/sell instructions
+  # are simple account writes; 40,000 CU is generous headroom measured
+  # against similar Anchor program calls, not a hard on-chain requirement.
+  compute_unit_limit: 40000
+  # The priority fee actually paid, in SOL, per transaction. 0.0 is
+  # DELIBERATE -- this project has explicitly dropped the latency race
+  # (see the PRD's Out of Scope section), so paying for faster inclusion
+  # buys nothing strategically yet. Raising this is a measured experiment
+  # for later (compare EntryFilled latency and the skip/failure funnel at
+  # 0 vs a nonzero fee), not a default to bump casually.
+  priority_fee_sol: 0.0
 
 exits:
   take_profit_1_multiple: 1.5

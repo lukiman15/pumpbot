@@ -50,7 +50,7 @@ from solders.transaction import Transaction
 from spl.token.instructions import create_idempotent_associated_token_account
 
 from pumpbot.ata_close import close_ata_after_exit
-from pumpbot.config import PROJECT_ROOT, Settings, load_settings
+from pumpbot.config import PROJECT_ROOT, FeesConfig, Settings, load_settings
 from pumpbot.curve import (
     LAMPORTS_PER_SOL,
     TOKEN_DECIMALS,
@@ -110,6 +110,8 @@ from pumpbot.submit import (
     ConfirmationTimeoutError,
     OnChainFailureError,
     SubmissionError,
+    build_compute_budget_instructions,
+    estimate_entry_fee_lamports,
     send_and_confirm,
 )
 
@@ -384,15 +386,20 @@ async def _simulate(rpc: RpcClient, instructions: list | object, fee_payer: Pubk
 
 def _build_buy(
     mint: Pubkey, wallet_pubkey: Pubkey, creator: Pubkey, token_program_id: Pubkey,
-    tokens_out_raw: int, max_sol_cost_lamports: int,
+    tokens_out_raw: int, max_sol_cost_lamports: int, fees_config: FeesConfig,
 ) -> list:
-    """Returns [create-ATA, buy] -- a live test found that simulating the
-    bare buy instruction alone fails with AccountNotInitialized on
-    associated_user for every brand-new mint, since the wallet has never
-    held this token before and nothing creates its ATA first. Real pump.fun
-    clients bundle an idempotent create-ATA instruction ahead of buy in the
-    same transaction; simulating buy alone was testing something no real
-    client actually sends."""
+    """Returns [compute-budget..., create-ATA, buy]. The compute-budget
+    instructions are prepended here (not in send_and_confirm) specifically
+    so the exact same instruction list is both simulated (via _simulate,
+    below) and later sent for real -- see submit.py's
+    build_compute_budget_instructions docstring for the fee formula.
+
+    A live test found that simulating the bare buy instruction alone fails
+    with AccountNotInitialized on associated_user for every brand-new
+    mint, since the wallet has never held this token before and nothing
+    creates its ATA first. Real pump.fun clients bundle an idempotent
+    create-ATA instruction ahead of buy in the same transaction; simulating
+    buy alone was testing something no real client actually sends."""
     create_ata_ix = create_idempotent_associated_token_account(
         payer=wallet_pubkey, owner=wallet_pubkey, mint=mint, token_program_id=token_program_id
     )
@@ -411,7 +418,7 @@ def _build_buy(
         amount_tokens_raw=tokens_out_raw,
         max_sol_cost_lamports=max_sol_cost_lamports,
     )
-    return [create_ata_ix, buy_ix]
+    return [*build_compute_budget_instructions(fees_config), create_ata_ix, buy_ix]
 
 
 async def _simulate_buy(
@@ -420,6 +427,7 @@ async def _simulate_buy(
     candidate: Candidate,
     position_sol_lamports: int,
     slippage_tolerance_fraction: float,
+    fees_config: FeesConfig,
 ) -> tuple[bool, int, str | None, bool, str | None]:
     """Returns (would_succeed, tokens_out_raw, error_summary, is_transient,
     token_program_id_used).
@@ -456,7 +464,8 @@ async def _simulate_buy(
     max_sol_cost_lamports = round(position_sol_lamports * (1 + slippage_tolerance_fraction))
     creator = Pubkey.from_string(candidate.creator)
     optimistic_ix = _build_buy(
-        mint, wallet_pubkey, creator, TOKEN_2022_PROGRAM_ID, tokens_out_raw, max_sol_cost_lamports
+        mint, wallet_pubkey, creator, TOKEN_2022_PROGRAM_ID, tokens_out_raw,
+        max_sol_cost_lamports, fees_config,
     )
     optimistic_error = await _simulate(rpc, optimistic_ix, wallet_pubkey)
     if optimistic_error is None:
@@ -470,7 +479,8 @@ async def _simulate_buy(
         return False, tokens_out_raw, f"resolve_token_program_id failed: {exc}", False, None
 
     ix = _build_buy(
-        mint, wallet_pubkey, creator, token_program_id, tokens_out_raw, max_sol_cost_lamports
+        mint, wallet_pubkey, creator, token_program_id, tokens_out_raw,
+        max_sol_cost_lamports, fees_config,
     )
     error = await _simulate(rpc, ix, wallet_pubkey)
     return error is None, tokens_out_raw, error, False, str(token_program_id)
@@ -478,9 +488,12 @@ async def _simulate_buy(
 
 def _build_sell(
     mint: Pubkey, wallet_pubkey: Pubkey, creator: Pubkey, token_program_id: Pubkey,
-    tokens_raw: int, min_sol_output_lamports: int,
-):
-    return build_sell_instruction(
+    tokens_raw: int, min_sol_output_lamports: int, fees_config: FeesConfig,
+) -> list:
+    """Returns [compute-budget..., sell] -- see _build_buy's docstring for
+    why the compute-budget instructions are prepended here rather than in
+    send_and_confirm."""
+    sell_ix = build_sell_instruction(
         mint=mint,
         user=wallet_pubkey,
         creator=creator,
@@ -499,6 +512,7 @@ def _build_sell(
         amount_tokens_raw=tokens_raw,
         min_sol_output_lamports=min_sol_output_lamports,
     )
+    return [*build_compute_budget_instructions(fees_config), sell_ix]
 
 
 async def _simulate_sell(
@@ -508,6 +522,7 @@ async def _simulate_sell(
     creator: Pubkey,
     tokens_raw: int,
     min_sol_output_lamports: int,
+    fees_config: FeesConfig,
     known_token_program_id: Pubkey | None = None,
 ) -> tuple[str | None, Pubkey | None]:
     """Returns (error, token_program_id_used) -- the resolved token program
@@ -537,7 +552,10 @@ async def _simulate_sell(
         except Exception as exc:  # noqa: BLE001 - summarized into the return value, not swallowed
             return f"resolve_token_program_id failed: {exc}", None
 
-    ix = _build_sell(mint, wallet_pubkey, creator, token_program_id, tokens_raw, min_sol_output_lamports)
+    ix = _build_sell(
+        mint, wallet_pubkey, creator, token_program_id, tokens_raw,
+        min_sol_output_lamports, fees_config,
+    )
     error = await _simulate(rpc, ix, wallet_pubkey)
     return error, token_program_id
 
@@ -560,6 +578,7 @@ async def run_trader(
     slippage_tolerance_fraction = settings.config.trading.slippage_tolerance_fraction
     failure_limit = settings.config.failsafe.consecutive_failure_limit
     dry_run = settings.secrets.dry_run
+    fees_config = settings.config.fees
 
     while True:
         candidate = await queue.get()
@@ -632,9 +651,33 @@ async def run_trader(
                 )
                 continue
 
+        estimated_fee_lamports = estimate_entry_fee_lamports(fees_config, signature_count=1)
+        max_allowed_fraction_lamports = fees_config.max_fee_fraction * position_sol_lamports
+        max_allowed_absolute_lamports = fees_config.max_fee_absolute_sol * LAMPORTS_PER_SOL
+        if (
+            estimated_fee_lamports > max_allowed_fraction_lamports
+            or estimated_fee_lamports > max_allowed_absolute_lamports
+        ):
+            # A fee-gate rejection is a normal skip, exactly like a tier-2
+            # rejection -- NOT an execution failure. Do NOT call
+            # record_failure() here (same bug class flagged in Milestone 1
+            # for tier-2 rejects): this would halt entries after 3
+            # consecutive hits over a deterministic config mismatch, not a
+            # sign anything is broken.
+            detail = (
+                f"estimated_fee_lamports={estimated_fee_lamports} exceeds "
+                f"max_fee_fraction*position={max_allowed_fraction_lamports:.0f} "
+                f"or max_fee_absolute_sol={max_allowed_absolute_lamports:.0f}"
+            )
+            logger.info("skip mint=%s: fee gate rejected (%s)", candidate.mint, detail)
+            ledger.append(CandidateSkipped(mint=candidate.mint, reason="fee_gate", detail=detail))
+            shadow_tracker.track(candidate.mint, arm="skipped", reject_reason="fee_gate")
+            continue
+
         try:
             would_succeed, tokens_out_raw, error, is_transient, token_program_id = await _simulate_buy(
-                rpc, wallet_pubkey, candidate, position_sol_lamports, slippage_tolerance_fraction
+                rpc, wallet_pubkey, candidate, position_sol_lamports, slippage_tolerance_fraction,
+                fees_config,
             )
         except Exception as exc:
             logger.exception("buy simulation crashed for mint=%s", candidate.mint)
@@ -680,7 +723,7 @@ async def run_trader(
             # behaves identically for a given mint, see program.py).
             real_ix = _build_buy(
                 mint, wallet_pubkey, creator, Pubkey.from_string(token_program_id),
-                tokens_out_raw, max_sol_cost_lamports,
+                tokens_out_raw, max_sol_cost_lamports, fees_config,
             )
             try:
                 signature = await send_and_confirm(rpc, keypair, real_ix, settings.config.execution)
@@ -771,6 +814,10 @@ async def run_position_monitor(
     slippage_tolerance_fraction = settings.config.trading.slippage_tolerance_fraction
     failure_limit = settings.config.failsafe.consecutive_failure_limit
     dry_run = settings.secrets.dry_run
+    # Exits and ATA closes are NEVER fee-gated (5.5) -- fees_config is only
+    # used here to size the compute-budget instructions on the sell/close
+    # transactions themselves, never to reject one.
+    fees_config = settings.config.fees
 
     while True:
         await asyncio.sleep(POSITION_MONITOR_INTERVAL_SECONDS)
@@ -825,6 +872,7 @@ async def run_position_monitor(
                         Pubkey.from_string(creator),
                         tokens_to_sell_raw,
                         min_sol_output_lamports,
+                        fees_config,
                         known_token_program_id=(
                             Pubkey.from_string(known_token_program)
                             if known_token_program is not None
@@ -847,10 +895,10 @@ async def run_position_monitor(
             if not dry_run:
                 real_ix = _build_sell(
                     mint, wallet_pubkey, Pubkey.from_string(creator), resolved_token_program,
-                    tokens_to_sell_raw, min_sol_output_lamports,
+                    tokens_to_sell_raw, min_sol_output_lamports, fees_config,
                 )
                 try:
-                    signature = await send_and_confirm(rpc, keypair, [real_ix], settings.config.execution)
+                    signature = await send_and_confirm(rpc, keypair, real_ix, settings.config.execution)
                 except (SubmissionError, OnChainFailureError) as exc:
                     logger.warning(
                         "real sell failed mint=%s reason=%s decision=%s -- leaving "
@@ -913,7 +961,8 @@ async def run_position_monitor(
             if position.tokens_remaining <= 0:
                 if not dry_run and resolved_token_program is not None:
                     ata_signature = await close_ata_after_exit(
-                        rpc, keypair, mint, resolved_token_program, settings.config.execution
+                        rpc, keypair, mint, resolved_token_program, settings.config.execution,
+                        fees_config,
                     )
                     if ata_signature is not None:
                         ata_settlement = await _settle_leg(
@@ -954,6 +1003,15 @@ async def run_reconciliation(settings: Settings, rpc: RpcClient, wallet_pubkey: 
             )
         except Exception:
             logger.exception("reconciliation check failed")
+
+
+def count_real_closed_trades(events) -> int:
+    """Counts TradeClosed events from real (non-dry-run) runs -- the only
+    trades that carry real expectancy evidence. Dry-run "trades" never
+    touch the chain and can't inform whether raising position_sol is
+    supported by data. Used by the startup sizing-discipline guard
+    (MILESTONE-3-HANDOFF.md Section 5.6)."""
+    return sum(1 for e in events if e.get("event") == "TradeClosed" and e.get("dry_run") is False)
 
 
 async def _on_heartbeat(report: HeartbeatReport) -> None:
@@ -1004,6 +1062,23 @@ async def main() -> None:
                     "appended TradeOrphaned, excluded from statistics",
                     len(orphans),
                 )
+
+            baseline_position_sol = settings.config.trading.baseline_position_sol
+            min_closed_trades_before_sizeup = settings.config.trading.min_closed_trades_before_sizeup
+            if settings.config.trading.position_sol > baseline_position_sol:
+                real_closed_trades = count_real_closed_trades(read_events(ledger_path.parent))
+                if real_closed_trades < min_closed_trades_before_sizeup:
+                    # Never refuses to start -- it's the operator's money and
+                    # their call (MILESTONE-3-HANDOFF.md Section 5.6), but a
+                    # position size raised ahead of the data that would
+                    # justify it needs to be loud, not silent.
+                    logger.critical(
+                        "sizing discipline: position_sol=%.4f exceeds baseline_position_sol=%.4f "
+                        "with only %d/%d real closed trades -- expectancy at this size is "
+                        "UNMEASURED, starting anyway",
+                        settings.config.trading.position_sol, baseline_position_sol,
+                        real_closed_trades, min_closed_trades_before_sizeup,
+                    )
 
         queue: asyncio.Queue[Candidate] = asyncio.Queue(maxsize=CANDIDATE_QUEUE_MAXSIZE)
         listener = MintListener(tier1_filter, queue, ledger=ledger, shadow_tracker=shadow_tracker)

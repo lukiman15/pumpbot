@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -22,6 +22,14 @@ class TradingConfig(BaseModel):
     max_concurrent_positions: int
     v2_features_unlock_balance_sol: float
     slippage_tolerance_fraction: float
+    # Sizing-discipline guard (main.py, startup): if position_sol is raised
+    # above this while the ledger holds fewer than
+    # min_closed_trades_before_sizeup real closed trades, a loud CRITICAL
+    # warning fires -- but the bot still starts. See
+    # MILESTONE-3-HANDOFF.md Section 5.6: it's the operator's money and
+    # their call, not something a config file should refuse to run over.
+    baseline_position_sol: float
+    min_closed_trades_before_sizeup: int
 
 
 class FeesConfig(BaseModel):
@@ -29,6 +37,24 @@ class FeesConfig(BaseModel):
     max_fee_absolute_sol: float
     priority_fee_ceiling_sol: float
     close_fee_reserve_sol: float
+    # Explicit rather than relying on the default 200,000-CU-per-instruction
+    # assumption -- a tight limit is free and improves scheduling, and is
+    # emitted even when priority_fee_sol is 0.0 (see submit.py's
+    # build_compute_budget_instructions).
+    compute_unit_limit: int
+    # The priority fee actually paid, in SOL, per transaction -- 0.0 is the
+    # deliberate default. Raising it is a measured experiment for later
+    # (see MILESTONE-3-HANDOFF.md Section 5.1), not a setting to tune here.
+    priority_fee_sol: float
+
+    @model_validator(mode="after")
+    def _priority_fee_within_ceiling(self) -> FeesConfig:
+        if self.priority_fee_sol > self.priority_fee_ceiling_sol:
+            raise ValueError(
+                f"fees.priority_fee_sol ({self.priority_fee_sol}) exceeds "
+                f"fees.priority_fee_ceiling_sol ({self.priority_fee_ceiling_sol})"
+            )
+        return self
 
 
 class ExitsConfig(BaseModel):

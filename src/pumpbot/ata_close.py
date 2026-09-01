@@ -28,7 +28,7 @@ from solders.pubkey import Pubkey
 from spl.token.instructions import close_account
 from spl.token.models import CloseAccountParams
 
-from pumpbot.config import ExecutionConfig
+from pumpbot.config import ExecutionConfig, FeesConfig
 from pumpbot.program import derive_associated_token_address
 from pumpbot.rpc import RpcClient
 from pumpbot.submit import (
@@ -36,6 +36,7 @@ from pumpbot.submit import (
     ConfirmationTimeoutError,
     OnChainFailureError,
     SubmissionError,
+    build_compute_budget_instructions,
     send_and_confirm,
 )
 
@@ -67,13 +68,20 @@ async def close_ata_after_exit(
     mint: Pubkey,
     token_program_id: Pubkey,
     execution_config: ExecutionConfig,
+    fees_config: FeesConfig,
 ) -> str | None:
     """Attempts to close the wallet's ATA for `mint`, recovering its rent.
 
     Returns the confirmed close signature, or None if there was nothing to
     close (account already gone) or every retry was exhausted (rent left
     unrecovered -- logged, never raised: see module docstring on why this
-    must never propagate as a failure to the caller)."""
+    must never propagate as a failure to the caller).
+
+    fees_config is used only to size this close's compute-budget
+    instructions (see submit.py's build_compute_budget_instructions) --
+    an ATA close is never fee-gated (capital/rent recovery beats fee
+    discipline; close_fee_reserve_sol exists precisely so a pending close
+    is never left unpayable), so fees_config never causes this to reject."""
     ata = derive_associated_token_address(keypair.pubkey(), mint, token_program_id)
 
     for attempt in range(1, execution_config.ata_close_max_retries + 1):
@@ -113,8 +121,9 @@ async def close_ata_after_exit(
                 owner=keypair.pubkey(),
             )
         )
+        instructions = [*build_compute_budget_instructions(fees_config), close_ix]
         try:
-            signature = await send_and_confirm(rpc, keypair, [close_ix], execution_config)
+            signature = await send_and_confirm(rpc, keypair, instructions, execution_config)
         except (SubmissionError, OnChainFailureError, ConfirmationTimeoutError, BlockhashExpiredError) as exc:
             logger.warning(
                 "ata_close: close attempt failed mint=%s attempt=%d/%d: %s",
