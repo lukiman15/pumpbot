@@ -98,12 +98,45 @@ Design choices:
 Covered by `tests/test_ata_close.py` against a scripted fake RPC -- no real
 network call or funds in any test.
 
-Still needed before wiring the full live loop makes sense:
-- Deciding *when* `main.py` calls `close_ata_after_exit` -- right after
-  `position.tokens_remaining` hits 0 in `run_position_monitor`, once real
-  sells replace the current `_simulate` calls.
-- Real integration into `run_trader`/`run_position_monitor` in place of the
-  `_simulate` calls.
+## The real-send path is now wired into main.py
+
+`run_trader` and `run_position_monitor` both still simulate first, exactly
+as before -- that gate never goes away, DRY_RUN or not. What changed:
+
+- **`DRY_RUN=true`** (still the default): unchanged behavior. A passing
+  simulation is logged as `[DRY RUN] simulated ... would succeed`, and
+  position/state bookkeeping proceeds as if it landed. Nothing is ever
+  signed or sent.
+- **`DRY_RUN=false`**: once simulation passes, `submit.py`'s
+  `send_and_confirm` signs and submits for real. Position/state bookkeeping
+  only happens **after** real on-chain confirmation, never optimistically.
+  A sell that brings `tokens_remaining` to 0 additionally calls
+  `close_ata_after_exit` (best-effort rent recovery).
+
+`send_and_confirm`'s four outcomes are handled distinctly, not collapsed
+into one "trade failed" bucket:
+- `SubmissionError` / `OnChainFailureError` -- definite outcomes (rejected
+  before landing, or landed and failed). No position was opened/no state
+  changed; counts as an ordinary failure against the failsafe.
+- `ConfirmationTimeoutError` / an exhausted `BlockhashExpiredError` --
+  **UNKNOWN outcome**. The transaction might have landed with no
+  confirmation observed. Guessing either way (assume success, assume
+  failure) risks tracking phantom tokens or stranding real ones, so
+  instead: `TradingState.halt_entries_immediately` stops all new entries
+  right away (not after a threshold, unlike ordinary failures), logs
+  CRITICAL with the signature, and leaves any open position exactly as it
+  was for manual reconciliation against the real chain.
+
+`main()` no longer refuses to start on `DRY_RUN=false` -- that refusal
+existed only because the send/confirm/close code didn't exist yet, and now
+it does. Nothing in this codebase flips `DRY_RUN` itself; on startup, a
+`DRY_RUN=false` run logs a loud `*** LIVE MODE ***` warning banner so
+whoever starts it knows real funds are in play.
+
+Still not built: a UI/process for the manual reconciliation
+`halt_entries_immediately` asks for -- today that's "read the CRITICAL log
+line, look up the signature on an explorer, decide what to do next," which
+is fine at this project's tiny scale but worth knowing going in.
 
 ## Status
 
