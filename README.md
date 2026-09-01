@@ -30,6 +30,40 @@ Read the printed report for:
    this rejects almost everything, do not proceed to build the trading
    loop under this configuration.
 
+## Real signing/submission: built, not yet wired into the live loop
+
+`src/pumpbot/submit.py` is the first piece of the actual-send path:
+`get_recent_blockhash` (real `getLatestBlockhash`, `confirmed` commitment),
+`sign_transaction` (real `Keypair.new_signed_with_payer` signing --
+single-signer only, since this project is never CPI'd the way the
+historical live samples in `program.py` were), `send_transaction` (real
+`sendTransaction`), `confirm_transaction` (polls `getSignatureStatuses`
+until confirmed, raising `OnChainFailureError` immediately on an on-chain
+error or `ConfirmationTimeoutError` if nothing is ever observed), and
+`send_and_confirm` wiring all four together. Covered by
+`tests/test_submit.py` against a scripted fake RPC -- no real network call,
+no real funds, in any test.
+
+This is a genuinely different kind of action from everything else in this
+repo: everywhere else, `simulateTransaction` is read-only and nothing is
+ever signed or broadcast. `submit.py` CAN move real SOL on mainnet.
+Deliberately, nothing in `main.py`'s current `DRY_RUN=true` path calls it
+yet -- wiring it into `run_trader`/`run_position_monitor` and flipping
+`DRY_RUN=false` is a separate step for whoever operates this bot to do
+themselves, not something this codebase should do on its own. `main()`
+still refuses to start with `DRY_RUN=false` until that wiring exists.
+
+Still needed before that wiring makes sense:
+- ATA lifecycle: `submit.py` doesn't yet decide *when* to close a position's
+  ATA after a full exit (rent recovery) -- that's a `main.py`-level policy
+  question, not a `submit.py` one.
+- Blockhash-expiry handling: `send_and_confirm` currently just waits out
+  `confirm_timeout_seconds`; it doesn't yet check `lastValidBlockHeight` to
+  know when a transaction can no longer land at all (vs. hasn't landed
+  *yet*) and decide whether to resubmit with a fresh blockhash.
+- Real integration into `run_trader`/`run_position_monitor` in place of the
+  `_simulate` calls, once the two items above exist.
+
 ## Status
 
 - [x] Scaffold, `config.py`, `rpc.py`, `program.py` (constants, PDAs, and the
