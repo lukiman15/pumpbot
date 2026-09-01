@@ -143,6 +143,12 @@ class RpcClient:
         raise RpcError(f"{method} failed after {cfg.max_retries} retries") from last_exc
 
     async def get_balance_sol(self, pubkey: str) -> float:
-        result = await self.call("getBalance", [pubkey])
+        # `confirmed` reflects state from ~0.1s after a transaction lands,
+        # vs the ~10s lag of the default `finalized` commitment -- without
+        # this a balance check right after a real send can read stale (see
+        # pumpbot-sniper-status.md's note on the first live trade's
+        # close-out, where an omitted commitment here made a completed sell
+        # look like it hadn't happened yet).
+        result = await self.call("getBalance", [pubkey, {"commitment": "confirmed"}])
         lamports = result["value"]
         return lamports / 1_000_000_000

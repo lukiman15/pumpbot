@@ -72,7 +72,8 @@ from pumpbot.filters.tier1 import (
 )
 from pumpbot.heartbeat import Heartbeat, HeartbeatReport
 from pumpbot.listener import MintListener
-from pumpbot.positions import Position, PositionManager
+from pumpbot.persistence import load_state, save_state
+from pumpbot.positions import Position, PositionLimitReachedError, PositionManager
 from pumpbot.program import (
     TOKEN_2022_PROGRAM_ID,
     derive_bonding_curve_pda,
@@ -94,6 +95,7 @@ logger = logging.getLogger("pumpbot.main")
 
 CANDIDATE_QUEUE_MAXSIZE = 100
 POSITION_MONITOR_INTERVAL_SECONDS = 2.0
+STATE_PATH = PROJECT_ROOT / "state" / "positions.json"
 
 
 class PreflightError(RuntimeError):
@@ -150,6 +152,22 @@ class TradingState:
 
     def token_program_for(self, mint: str) -> str | None:
         return self._token_programs.get(mint)
+
+    def all_creators(self) -> dict[str, str]:
+        return dict(self._creators)
+
+    def all_token_programs(self) -> dict[str, str]:
+        return dict(self._token_programs)
+
+
+def _persist(position_manager: PositionManager, state: TradingState) -> None:
+    """Best-effort: a failed save shouldn't crash the trading loop, but it
+    does mean the next restart could lose track of open positions, so it's
+    logged loudly rather than silently swallowed."""
+    try:
+        save_state(STATE_PATH, position_manager, state.all_creators(), state.all_token_programs())
+    except Exception:
+        logger.exception("failed to persist position state to %s", STATE_PATH)
 
 
 def _load_keypair(path: str) -> Keypair:
@@ -478,6 +496,7 @@ async def run_trader(
         state.remember_creator(candidate.mint, candidate.creator)
         if token_program_id is not None:
             state.remember_token_program(candidate.mint, token_program_id)
+        _persist(position_manager, state)
         heartbeat.record_trade()
 
 
@@ -620,6 +639,7 @@ async def run_position_monitor(
                         rpc, keypair, mint, resolved_token_program, settings.config.execution
                     )
                 position_manager.close(position.mint)
+            _persist(position_manager, state)
 
 
 async def run_reconciliation(settings: Settings, rpc: RpcClient, wallet_pubkey: Pubkey) -> None:
@@ -668,6 +688,27 @@ async def main() -> None:
         position_manager = PositionManager(settings.config.trading.max_concurrent_positions)
         heartbeat = Heartbeat(settings.config.heartbeat)
         state = TradingState()
+
+        restored_positions, restored_creators, restored_token_programs = load_state(STATE_PATH)
+        for position in restored_positions:
+            try:
+                position_manager.open(position)
+            except PositionLimitReachedError:
+                logger.critical(
+                    "restored position for mint=%s exceeds max_concurrent_positions "
+                    "(%d) -- left out of tracking, reconcile manually",
+                    position.mint, settings.config.trading.max_concurrent_positions,
+                )
+        for mint, creator in restored_creators.items():
+            state.remember_creator(mint, creator)
+        for mint, token_program_id in restored_token_programs.items():
+            state.remember_token_program(mint, token_program_id)
+        if restored_positions:
+            logger.warning(
+                "restored %d open position(s) from %s -- carried over from a "
+                "previous run",
+                len(restored_positions), STATE_PATH,
+            )
 
         if settings.secrets.dry_run:
             logger.info(
