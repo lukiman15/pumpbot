@@ -36,6 +36,8 @@ import websockets
 
 from pumpbot.curve import TOTAL_SUPPLY_WHOLE_TOKENS, from_virtual_reserves
 from pumpbot.filters.tier1 import Candidate, Tier1Filter
+from pumpbot.ledger import CandidateRejected, CandidateSeen, Ledger
+from pumpbot.shadow import ShadowTracker
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +60,16 @@ class NewMintEvent:
     notified_at: float
     is_mayhem_mode: bool
     uri: str
+    # Parallel wall-clock capture of `notified_at` -- monotonic time isn't
+    # comparable across restarts, but ledger.py's EntryFilled.latency_seconds
+    # needs to be. Defaults to 0.0 so existing call sites/tests that only
+    # pass `notified_at` keep working unchanged.
+    notified_at_wall: float = 0.0
 
 
-def parse_create_message(msg: dict, notified_at: float) -> NewMintEvent | None:
+def parse_create_message(
+    msg: dict, notified_at: float, notified_at_wall: float = 0.0
+) -> NewMintEvent | None:
     """Returns None for anything that isn't a well-formed create event --
     non-create messages (subscription acks, trade events), or a create
     event missing the mint address we need to act on it at all."""
@@ -78,6 +87,7 @@ def parse_create_message(msg: dict, notified_at: float) -> NewMintEvent | None:
         notified_at=notified_at,
         is_mayhem_mode=bool(msg.get("is_mayhem_mode", False)),
         uri=msg.get("uri", ""),
+        notified_at_wall=notified_at_wall,
     )
 
 
@@ -96,6 +106,7 @@ def event_to_candidate(event: NewMintEvent) -> Candidate:
         curve=curve,
         is_mayhem_mode=event.is_mayhem_mode,
         uri=event.uri,
+        notified_at_wall=event.notified_at_wall,
     )
 
 
@@ -106,9 +117,17 @@ class MintListener:
     only once a connection survives 30s.
     """
 
-    def __init__(self, tier1_filter: Tier1Filter, queue: asyncio.Queue[Candidate]) -> None:
+    def __init__(
+        self,
+        tier1_filter: Tier1Filter,
+        queue: asyncio.Queue[Candidate],
+        ledger: Ledger | None = None,
+        shadow_tracker: ShadowTracker | None = None,
+    ) -> None:
         self._filter = tier1_filter
         self._queue = queue
+        self._ledger = ledger
+        self._shadow = shadow_tracker
         self._recent_mint_timestamps: list[float] = []
 
     async def run(self) -> None:
@@ -143,7 +162,8 @@ class MintListener:
             return
 
         now = time.monotonic()
-        event = parse_create_message(msg, now)
+        now_wall = time.time()
+        event = parse_create_message(msg, now, now_wall)
         if event is None:
             return
 
@@ -154,9 +174,38 @@ class MintListener:
         ]
 
         candidate = event_to_candidate(event)
+
+        # CandidateSeen is emitted here -- once per create event this
+        # project's own parser accepts, before Tier1Filter runs -- so it is
+        # the sole denominator for scripts/report.py's funnel. run_trader
+        # does NOT emit this: by the time a candidate reaches it, it has
+        # already passed tier1, so a tier1 reject would never produce one.
+        if self._ledger is not None:
+            self._ledger.append(
+                CandidateSeen(
+                    mint=candidate.mint,
+                    creator=candidate.creator,
+                    name=candidate.name,
+                    symbol=candidate.symbol,
+                    uri=candidate.uri,
+                    creator_supply_fraction=candidate.creator_supply_fraction,
+                    virtual_sol_in_curve=event.virtual_sol_in_curve,
+                    virtual_tokens_in_curve=event.virtual_tokens_in_curve,
+                    notified_at_wall=event.notified_at_wall,
+                )
+            )
+
         result = self._filter.evaluate(candidate, self._recent_mint_timestamps, now)
         if not result.passed:
             logger.info("reject mint=%s reason=%s", candidate.mint, result.reason.value)
+            if self._ledger is not None:
+                self._ledger.append(
+                    CandidateRejected(mint=candidate.mint, reason=result.reason.value)
+                )
+            if self._shadow is not None:
+                self._shadow.track(
+                    candidate.mint, arm="rejected", reject_reason=result.reason.value
+                )
             return
 
         logger.info("candidate accepted mint=%s", candidate.mint)

@@ -54,6 +54,11 @@ class Candidate:
     # Metadata JSON URI, unused by tier1 (no I/O here) -- carried through
     # for tier2.py's social-metadata gate. See filters/tier2.py.
     uri: str = ""
+    # time.time() at the moment the listener parsed this create event --
+    # unused by tier1 itself, carried through so ledger.py's EntryFilled
+    # can compute latency_seconds. Wall-clock (not monotonic) so latency
+    # is comparable across restarts.
+    notified_at_wall: float = 0.0
 
 
 def load_creator_blocklist(path: str | Path) -> set[str]:

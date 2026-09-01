@@ -38,6 +38,7 @@ import base64
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -73,6 +74,19 @@ from pumpbot.filters.tier1 import (
 )
 from pumpbot.filters.tier2 import Tier2Filter
 from pumpbot.heartbeat import Heartbeat, HeartbeatReport
+from pumpbot.ledger import (
+    AtaClosed,
+    CandidateSkipped,
+    EntryFilled,
+    ExitFilled,
+    Ledger,
+    Tier2Evaluated,
+    TradeClosed,
+    find_orphans,
+    new_run_id,
+    new_trade_id,
+    read_events,
+)
 from pumpbot.listener import MintListener
 from pumpbot.persistence import load_state, save_state
 from pumpbot.positions import Position, PositionLimitReachedError, PositionManager
@@ -84,6 +98,13 @@ from pumpbot.program import (
     pick_fee_recipient,
 )
 from pumpbot.rpc import RpcClient
+from pumpbot.settlement import (
+    Settlement,
+    SettlementMismatchError,
+    SettlementUnavailableError,
+    settle,
+)
+from pumpbot.shadow import ShadowTracker
 from pumpbot.submit import (
     BlockhashExpiredError,
     ConfirmationTimeoutError,
@@ -104,6 +125,12 @@ class PreflightError(RuntimeError):
     """Raised when startup conditions aren't safe to trade under."""
 
 
+@dataclass
+class _LegRecord:
+    leg_kind: str  # "BUY" | "SELL" | "ATA_CLOSE"
+    settlement: Settlement | None
+
+
 class TradingState:
     """Mutable state shared between the trader, monitor, and reconciliation
     tasks that doesn't belong inside PositionManager itself."""
@@ -117,6 +144,14 @@ class TradingState:
         # instead of paying another resolve_token_program_id round-trip
         # (and its retries) against the same laggy RPC node.
         self._token_programs: dict[str, str] = {}
+        # trade_id bookkeeping for the ledger (ledger.py) -- purely
+        # in-memory, unlike persistence.py's positions.json, so a position
+        # that survives a restart has no trade_id here until
+        # ensure_trade_id_for mints one defensively (see that method).
+        self._trade_ids: dict[str, str] = {}  # mint -> currently open trade_id
+        self._trade_legs: dict[str, list[_LegRecord]] = {}
+        self._trade_entry_wall: dict[str, float] = {}
+        self._trade_exit_reasons: dict[str, list[str]] = {}
 
     def record_failure(self, limit: int) -> None:
         self._consecutive_failures += 1
@@ -160,6 +195,127 @@ class TradingState:
 
     def all_token_programs(self) -> dict[str, str]:
         return dict(self._token_programs)
+
+    def open_trade(self, mint: str) -> str:
+        """Mints a fresh trade_id for a buy that just confirmed. Call
+        exactly once per EntryFilled."""
+        trade_id = new_trade_id()
+        self._trade_ids[mint] = trade_id
+        self._trade_legs[trade_id] = []
+        self._trade_entry_wall[trade_id] = time.time()
+        self._trade_exit_reasons[trade_id] = []
+        return trade_id
+
+    def trade_id_for(self, mint: str) -> str | None:
+        return self._trade_ids.get(mint)
+
+    def ensure_trade_id_for(self, mint: str) -> str:
+        """Defensive fallback for a position that survived a restart via
+        persistence.py's positions.json without a matching trade_id --
+        this ledger's trade_id tracking is purely in-memory and doesn't
+        span restarts the way position bookkeeping does. Rare in practice
+        (see pumpbot-sniper-status.md's note on the one historical
+        mid-position restart) but must not crash the exit path."""
+        trade_id = self._trade_ids.get(mint)
+        if trade_id is None:
+            trade_id = self.open_trade(mint)
+            logger.warning(
+                "mint=%s had no trade_id on record (position likely restored "
+                "across a restart) -- minted a fresh trade_id=%s for it",
+                mint, trade_id,
+            )
+        return trade_id
+
+    def record_leg(self, trade_id: str, leg_kind: str, settlement: Settlement | None) -> None:
+        self._trade_legs.setdefault(trade_id, []).append(_LegRecord(leg_kind, settlement))
+
+    def record_exit_reason(self, trade_id: str, reason: str) -> None:
+        self._trade_exit_reasons.setdefault(trade_id, []).append(reason)
+
+    def pop_trade(self, mint: str) -> tuple[str, list[_LegRecord], list[str], float] | None:
+        """Removes and returns (trade_id, legs, exit_reasons, entry_ts_wall)
+        for a trade that just fully closed, or None if this mint has no
+        trade_id on record."""
+        trade_id = self._trade_ids.pop(mint, None)
+        if trade_id is None:
+            return None
+        legs = self._trade_legs.pop(trade_id, [])
+        exit_reasons = self._trade_exit_reasons.pop(trade_id, [])
+        entry_wall = self._trade_entry_wall.pop(trade_id, time.time())
+        return trade_id, legs, exit_reasons, entry_wall
+
+
+def _build_trade_closed(
+    mint: str,
+    trade_id: str,
+    legs: list[_LegRecord],
+    exit_reasons: list[str],
+    entry_ts_wall: float,
+    dry_run: bool,
+) -> TradeClosed:
+    """Aggregates a closed trade's legs per the plan's Accounting Rules.
+
+    dry_run forces all four PnL fields to None (never 0 -- a real trade's
+    turnover is never legitimately zero, and a silent 0 would read as
+    "closed flat" rather than "not applicable"). For a real trade, a field
+    is also None specifically where its one supporting leg's settlement
+    never arrived (e.g. gross_turnover with no readable BUY leg) --
+    settlement_complete flags this for downstream consumers rather than
+    hiding it behind a number that looks more complete than it is.
+    """
+    hold_seconds = time.time() - entry_ts_wall
+    settlement_complete = False if dry_run else all(leg.settlement is not None for leg in legs)
+
+    if dry_run:
+        realized_pnl_lamports = None
+        rent_recovered_lamports = None
+        total_fee_lamports = None
+        gross_turnover_lamports = None
+    else:
+        available = [leg.settlement for leg in legs if leg.settlement is not None]
+        realized_pnl_lamports = (
+            sum(s.sol_delta_lamports for s in available) if available else None
+        )
+        total_fee_lamports = sum(s.fee_lamports for s in available) if available else None
+        ata_close = next(
+            (leg.settlement for leg in legs if leg.leg_kind == "ATA_CLOSE" and leg.settlement),
+            None,
+        )
+        rent_recovered_lamports = ata_close.sol_delta_lamports if ata_close else 0
+        buy_leg = next(
+            (leg.settlement for leg in legs if leg.leg_kind == "BUY" and leg.settlement),
+            None,
+        )
+        gross_turnover_lamports = abs(buy_leg.sol_delta_lamports) if buy_leg else None
+
+    return TradeClosed(
+        mint=mint,
+        trade_id=trade_id,
+        realized_pnl_lamports=realized_pnl_lamports,
+        rent_recovered_lamports=rent_recovered_lamports,
+        total_fee_lamports=total_fee_lamports,
+        gross_turnover_lamports=gross_turnover_lamports,
+        hold_seconds=hold_seconds,
+        leg_count=len(legs),
+        exit_reasons=exit_reasons,
+        settlement_complete=settlement_complete,
+    )
+
+
+async def _settle_leg(
+    rpc: RpcClient, signature: str, wallet_pubkey: Pubkey, leg_kind: str, mint: str
+) -> Settlement | None:
+    """A settlement failure must never affect trading -- it's a read-only
+    afterthought on an already-confirmed trade. Logged at warning, never
+    raised."""
+    try:
+        return await settle(rpc, signature, str(wallet_pubkey), leg_kind)
+    except (SettlementUnavailableError, SettlementMismatchError) as exc:
+        logger.warning(
+            "settlement failed for leg=%s mint=%s signature=%s: %s",
+            leg_kind, mint, signature, exc,
+        )
+        return None
 
 
 def _persist(position_manager: PositionManager, state: TradingState) -> None:
@@ -396,6 +552,8 @@ async def run_trader(
     heartbeat: Heartbeat,
     state: TradingState,
     tier2_filter: Tier2Filter,
+    ledger: Ledger,
+    shadow_tracker: ShadowTracker,
 ) -> None:
     position_sol = settings.config.trading.position_sol
     position_sol_lamports = int(position_sol * LAMPORTS_PER_SOL)
@@ -409,9 +567,21 @@ async def run_trader(
 
         if state.entries_halted:
             logger.warning("skip mint=%s: entries halted by failsafe", candidate.mint)
+            ledger.append(
+                CandidateSkipped(mint=candidate.mint, reason="entries_halted", detail=None)
+            )
+            shadow_tracker.track(candidate.mint, arm="skipped", reject_reason="entries_halted")
             continue
         if not position_manager.can_open_new():
             logger.info("skip mint=%s: max_concurrent_positions reached", candidate.mint)
+            ledger.append(
+                CandidateSkipped(
+                    mint=candidate.mint, reason="max_concurrent_positions", detail=None
+                )
+            )
+            shadow_tracker.track(
+                candidate.mint, arm="skipped", reject_reason="max_concurrent_positions"
+            )
             continue
 
         if settings.config.filters.tier2.enabled:
@@ -421,9 +591,22 @@ async def run_trader(
             socials_count = sum(
                 [tier2_result.has_twitter, tier2_result.has_telegram, tier2_result.has_website]
             )
-            # This is the only record of a tier2 evaluation until Milestone 2
-            # promotes it to a Tier2Evaluated ledger event -- it must carry
-            # the full outcome category, not merely the pass/fail bit.
+            # This is the durable record of a tier2 evaluation -- emitted
+            # for every candidate the gate evaluates, pass or fail, so the
+            # gate's effect is measurable retroactively against the
+            # ledger, not just visible in a greppable log line.
+            ledger.append(
+                Tier2Evaluated(
+                    mint=candidate.mint,
+                    outcome=tier2_result.outcome.value,
+                    has_twitter=tier2_result.has_twitter,
+                    has_telegram=tier2_result.has_telegram,
+                    has_website=tier2_result.has_website,
+                    passed=tier2_result.passed,
+                    mode=settings.config.filters.tier2.mode,
+                    fetch_seconds=fetch_s,
+                )
+            )
             logger.info(
                 "tier2 mint=%s outcome=%s passed=%s socials=%d fetch_s=%.3f",
                 candidate.mint, tier2_result.outcome.value, tier2_result.passed,
@@ -438,14 +621,27 @@ async def run_trader(
                 logger.info(
                     "reject mint=%s reason=tier2_%s", candidate.mint, tier2_result.outcome.value
                 )
+                ledger.append(
+                    CandidateSkipped(
+                        mint=candidate.mint, reason="tier2_rejected",
+                        detail=tier2_result.outcome.value,
+                    )
+                )
+                shadow_tracker.track(
+                    candidate.mint, arm="skipped", reject_reason="tier2_rejected"
+                )
                 continue
 
         try:
             would_succeed, tokens_out_raw, error, is_transient, token_program_id = await _simulate_buy(
                 rpc, wallet_pubkey, candidate, position_sol_lamports, slippage_tolerance_fraction
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("buy simulation crashed for mint=%s", candidate.mint)
+            ledger.append(
+                CandidateSkipped(mint=candidate.mint, reason="sim_crashed", detail=str(exc))
+            )
+            shadow_tracker.track(candidate.mint, arm="skipped", reject_reason="sim_crashed")
             state.record_failure(failure_limit)
             continue
 
@@ -455,8 +651,20 @@ async def run_trader(
                 # recoverable condition on a brand-new mint, not a sign
                 # anything is broken. Doesn't count toward the failsafe.
                 logger.info("skip mint=%s: %s", candidate.mint, error)
+                ledger.append(
+                    CandidateSkipped(mint=candidate.mint, reason="mint_not_visible", detail=error)
+                )
+                shadow_tracker.track(
+                    candidate.mint, arm="skipped", reject_reason="mint_not_visible"
+                )
             else:
                 logger.info("simulated buy would fail mint=%s reason=%s", candidate.mint, error)
+                ledger.append(
+                    CandidateSkipped(mint=candidate.mint, reason="sim_would_fail", detail=error)
+                )
+                shadow_tracker.track(
+                    candidate.mint, arm="skipped", reject_reason="sim_would_fail"
+                )
                 state.record_failure(failure_limit)
             continue
 
@@ -502,18 +710,21 @@ async def run_trader(
         state.record_success()
         tokens_out_whole = tokens_out_raw / 10**TOKEN_DECIMALS
         entry_price_sol = position_sol / tokens_out_whole
+        confirmed_at_wall = time.time()
         if dry_run:
             logger.info(
                 "[DRY RUN] simulated buy would succeed mint=%s position_sol=%.4f "
                 "tokens=%.2f entry_price=%.10f",
                 candidate.mint, position_sol, tokens_out_whole, entry_price_sol,
             )
+            buy_settlement = None
         else:
             logger.info(
                 "buy confirmed mint=%s position_sol=%.4f tokens=%.2f "
                 "entry_price=%.10f signature=%s",
                 candidate.mint, position_sol, tokens_out_whole, entry_price_sol, signature,
             )
+            buy_settlement = await _settle_leg(rpc, signature, wallet_pubkey, "BUY", candidate.mint)
 
         position = Position(
             mint=candidate.mint,
@@ -525,6 +736,23 @@ async def run_trader(
         state.remember_creator(candidate.mint, candidate.creator)
         if token_program_id is not None:
             state.remember_token_program(candidate.mint, token_program_id)
+
+        trade_id = state.open_trade(candidate.mint)
+        state.record_leg(trade_id, "BUY", buy_settlement)
+        ledger.append(
+            EntryFilled(
+                mint=candidate.mint,
+                trade_id=trade_id,
+                signature=signature,
+                position_sol=position_sol,
+                tokens_bought=tokens_out_whole,
+                entry_price_sol=entry_price_sol,
+                latency_seconds=confirmed_at_wall - candidate.notified_at_wall,
+                settlement=buy_settlement.to_dict() if buy_settlement is not None else None,
+            )
+        )
+        shadow_tracker.track(candidate.mint, arm="bought", trade_id=trade_id)
+
         _persist(position_manager, state)
         heartbeat.record_trade()
 
@@ -537,6 +765,7 @@ async def run_position_monitor(
     position_manager: PositionManager,
     heartbeat: Heartbeat,
     state: TradingState,
+    ledger: Ledger,
 ) -> None:
     exits_cfg = settings.config.exits
     slippage_tolerance_fraction = settings.config.trading.slippage_tolerance_fraction
@@ -648,12 +877,14 @@ async def run_position_monitor(
 
             state.record_success()
             tokens_sold = position.apply_exit(decision)
+            trade_id = state.ensure_trade_id_for(position.mint)
             if dry_run:
                 logger.info(
                     "[DRY RUN] simulated sell would succeed mint=%s reason=%s "
                     "tokens_sold=%.2f remaining=%.2f",
                     position.mint, decision.reason.value, tokens_sold, position.tokens_remaining,
                 )
+                sell_settlement = None
             else:
                 logger.info(
                     "sell confirmed mint=%s reason=%s tokens_sold=%.2f "
@@ -661,13 +892,53 @@ async def run_position_monitor(
                     position.mint, decision.reason.value, tokens_sold,
                     position.tokens_remaining, signature,
                 )
+                sell_settlement = await _settle_leg(
+                    rpc, signature, wallet_pubkey, "SELL", position.mint
+                )
+            state.record_leg(trade_id, "SELL", sell_settlement)
+            state.record_exit_reason(trade_id, decision.reason.value)
+            ledger.append(
+                ExitFilled(
+                    mint=position.mint,
+                    trade_id=trade_id,
+                    signature=signature,
+                    exit_reason=decision.reason.value,
+                    tokens_sold=tokens_sold,
+                    tokens_remaining=position.tokens_remaining,
+                    curve_price_sol=current_price_sol,
+                    settlement=sell_settlement.to_dict() if sell_settlement is not None else None,
+                )
+            )
             heartbeat.record_trade()
             if position.tokens_remaining <= 0:
                 if not dry_run and resolved_token_program is not None:
-                    await close_ata_after_exit(
+                    ata_signature = await close_ata_after_exit(
                         rpc, keypair, mint, resolved_token_program, settings.config.execution
                     )
+                    if ata_signature is not None:
+                        ata_settlement = await _settle_leg(
+                            rpc, ata_signature, wallet_pubkey, "ATA_CLOSE", position.mint
+                        )
+                        state.record_leg(trade_id, "ATA_CLOSE", ata_settlement)
+                        ledger.append(
+                            AtaClosed(
+                                mint=position.mint,
+                                trade_id=trade_id,
+                                signature=ata_signature,
+                                settlement=(
+                                    ata_settlement.to_dict() if ata_settlement is not None else None
+                                ),
+                            )
+                        )
                 position_manager.close(position.mint)
+                popped = state.pop_trade(position.mint)
+                if popped is not None:
+                    _, legs, exit_reasons, entry_wall = popped
+                    ledger.append(
+                        _build_trade_closed(
+                            position.mint, trade_id, legs, exit_reasons, entry_wall, dry_run
+                        )
+                    )
             _persist(position_manager, state)
 
 
@@ -713,8 +984,29 @@ async def main() -> None:
         )
         tier2_filter = Tier2Filter(settings.config.filters.tier2, tier2_http_client)
 
+        run_id = new_run_id()
+        ledger_path = PROJECT_ROOT / settings.config.ledger.path
+        ledger = Ledger(
+            ledger_path,
+            run_id,
+            settings.secrets.dry_run,
+            enabled=settings.config.ledger.enabled,
+        )
+        shadow_tracker = ShadowTracker(settings.config.shadow, rpc, ledger)
+
+        if settings.config.ledger.enabled:
+            orphans = find_orphans(read_events(ledger_path.parent), run_id)
+            for orphan in orphans:
+                ledger.append(orphan)
+            if orphans:
+                logger.warning(
+                    "orphan scan: %d trade(s) from a previous run had no TradeClosed -- "
+                    "appended TradeOrphaned, excluded from statistics",
+                    len(orphans),
+                )
+
         queue: asyncio.Queue[Candidate] = asyncio.Queue(maxsize=CANDIDATE_QUEUE_MAXSIZE)
-        listener = MintListener(tier1_filter, queue)
+        listener = MintListener(tier1_filter, queue, ledger=ledger, shadow_tracker=shadow_tracker)
         position_manager = PositionManager(settings.config.trading.max_concurrent_positions)
         heartbeat = Heartbeat(settings.config.heartbeat)
         state = TradingState()
@@ -755,16 +1047,23 @@ async def main() -> None:
                 settings.config.trading.position_sol, settings.config.trading.max_concurrent_positions,
             )
 
-        await asyncio.gather(
-            listener.run(),
-            run_trader(
-                settings, rpc, keypair, wallet_pubkey, queue, position_manager, heartbeat,
-                state, tier2_filter,
-            ),
-            run_position_monitor(settings, rpc, keypair, wallet_pubkey, position_manager, heartbeat, state),
-            run_reconciliation(settings, rpc, wallet_pubkey),
-            heartbeat.run_forever(lambda: position_manager.open_count, _on_heartbeat),
-        )
+        try:
+            await asyncio.gather(
+                listener.run(),
+                run_trader(
+                    settings, rpc, keypair, wallet_pubkey, queue, position_manager, heartbeat,
+                    state, tier2_filter, ledger, shadow_tracker,
+                ),
+                run_position_monitor(
+                    settings, rpc, keypair, wallet_pubkey, position_manager, heartbeat, state,
+                    ledger,
+                ),
+                run_reconciliation(settings, rpc, wallet_pubkey),
+                heartbeat.run_forever(lambda: position_manager.open_count, _on_heartbeat),
+                shadow_tracker.run(),
+            )
+        finally:
+            ledger.close()
 
 
 if __name__ == "__main__":

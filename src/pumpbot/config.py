@@ -70,6 +70,11 @@ class FiltersConfig(BaseModel):
 
 class RpcConfig(BaseModel):
     rps_limit: int
+    # A disjoint token bucket from rps_limit's, so a burst of shadow polls
+    # (see shadow.py) can never queue ahead of a live trading call -- see
+    # that module's docstring for the measured queuing-delay math that
+    # makes a shared limiter unsafe here.
+    shadow_rps_limit: int
     credit_costs: dict[str, int]
     daily_credit_halt: int
     max_retries: int
@@ -102,6 +107,19 @@ class ProbeConfig(BaseModel):
     default_hours: float
 
 
+class LedgerConfig(BaseModel):
+    path: str
+    enabled: bool
+
+
+class ShadowConfig(BaseModel):
+    enabled: bool
+    sample_fraction: float
+    poll_interval_seconds: float
+    horizon_seconds: float
+    max_tracked: int
+
+
 class AppConfig(BaseModel):
     """Everything loaded from config.yaml."""
 
@@ -116,6 +134,8 @@ class AppConfig(BaseModel):
     execution: ExecutionConfig
     failsafe: FailsafeConfig
     probe: ProbeConfig
+    ledger: LedgerConfig
+    shadow: ShadowConfig
 
 
 class Secrets(BaseSettings):
@@ -141,7 +161,7 @@ class Settings:
         self.secrets = secrets
 
     @classmethod
-    def load(cls, config_path: Path | None = None) -> "Settings":
+    def load(cls, config_path: Path | None = None) -> Settings:
         path = config_path or (PROJECT_ROOT / "config.yaml")
         raw: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8"))
         return cls(config=AppConfig.model_validate(raw), secrets=Secrets())

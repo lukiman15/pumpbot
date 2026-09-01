@@ -57,7 +57,14 @@ filters:
   name_symbol_blocklist_path: data/name_blocklist.txt
 
 rpc:
-  rps_limit: 12
+  # Total node capacity is 12 req/s. 4 of that is reserved below for
+  # pool="shadow" (shadow.py) in a disjoint token bucket, specifically so a
+  # burst of shadow polls can never queue ahead of a live trading call --
+  # a shared limiter was measured to let exactly that happen (see
+  # shadow.py's module docstring). 8 req/s is far above real trading
+  # demand at max_concurrent_positions=1.
+  rps_limit: 8
+  shadow_rps_limit: 4
   # Rough per-method credit costs; correct against the real QuickNode dashboard after
   # the first live hour (see README).
   credit_costs:
@@ -101,3 +108,26 @@ failsafe:
 
 probe:
   default_hours: 1
+
+ledger:
+  # Rotated daily to <stem>-YYYY-MM-DD<suffix> beside this path (see
+  # ledger.py) -- an unbounded single file would make the startup orphan
+  # scan (find_orphans) grow without limit.
+  path: data/ledger.jsonl
+  enabled: true
+
+shadow:
+  # Off by default: polling costs real RPC budget even at a low
+  # sample_fraction, and it's meant to be switched on deliberately after
+  # observing credit burn under normal trading, not silently by default.
+  enabled: false
+  # Ignored for the "bought" arm, which is always sampled at 1.0 -- it's
+  # small (bounded by trade count) and sampling it would destroy the
+  # adverse-selection comparison it exists to enable. Applies to
+  # "rejected" and "skipped" only.
+  sample_fraction: 0.10
+  poll_interval_seconds: 15
+  # Matches exits.timeout_seconds deliberately, so the shadow horizon and
+  # the bot's own maximum hold are directly comparable.
+  horizon_seconds: 300
+  max_tracked: 50

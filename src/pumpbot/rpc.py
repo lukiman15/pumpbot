@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
@@ -50,26 +50,35 @@ CREDIT_EXEMPT_METHODS = {
 class RpcClient:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._limiter = AsyncLimiter(settings.config.rpc.rps_limit, time_period=1.0)
+        # Two disjoint token buckets, not one shared limiter split by
+        # weight -- see config.yaml's rpc.shadow_rps_limit comment and
+        # shadow.py's module docstring for the measured queuing-delay math
+        # that makes a shared limiter unsafe: a burst of shadow polls can
+        # otherwise queue ahead of a live trading call regardless of how
+        # the shares are tuned.
+        self._limiters = {
+            "trading": AsyncLimiter(settings.config.rpc.rps_limit, time_period=1.0),
+            "shadow": AsyncLimiter(settings.config.rpc.shadow_rps_limit, time_period=1.0),
+        }
         self._http = httpx.AsyncClient(timeout=15.0)
         self._id_counter = itertools.count(1)
         self._credits_spent_today = 0
-        self._credits_day: date = datetime.now(timezone.utc).date()
+        self._credits_day: date = datetime.now(UTC).date()
 
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def __aenter__(self) -> "RpcClient":
+    async def __aenter__(self) -> RpcClient:
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
     def _roll_credit_day(self) -> None:
         # QuickNode resets its own daily cap on its own clock (unknown to us);
         # UTC midnight is a documented, unambiguous approximation rather than
         # tying the halt to wherever this process happens to run.
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         if today != self._credits_day:
             self._credits_day = today
             self._credits_spent_today = 0
@@ -93,10 +102,18 @@ class RpcClient:
                 "Exits and reconciliation remain unaffected."
             )
 
-    async def call(self, method: str, params: list[Any] | None = None) -> Any:
-        """Send one JSON-RPC call, rate-limited, credit-metered, retried."""
+    async def call(
+        self, method: str, params: list[Any] | None = None, pool: str = "trading"
+    ) -> Any:
+        """Send one JSON-RPC call, rate-limited, credit-metered, retried.
+
+        `pool` selects which of the two disjoint rate limiters this call
+        draws from -- "trading" (the default, used by everything except
+        shadow.py) or "shadow" (shadow.py's forward-price polling only).
+        See __init__'s comment for why these are separate buckets."""
         self._check_credit_budget(method)
         cfg = self._settings.config.rpc
+        limiter = self._limiters[pool]
         payload = {
             "jsonrpc": "2.0",
             "id": next(self._id_counter),
@@ -106,7 +123,7 @@ class RpcClient:
 
         last_exc: Exception | None = None
         for attempt in range(cfg.max_retries + 1):
-            async with self._limiter:
+            async with limiter:
                 try:
                     resp = await self._http.post(
                         self._settings.secrets.quicknode_http_url, json=payload
