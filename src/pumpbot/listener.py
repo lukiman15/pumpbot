@@ -57,6 +57,7 @@ class NewMintEvent:
     virtual_tokens_in_curve: float
     notified_at: float
     is_mayhem_mode: bool
+    uri: str
 
 
 def parse_create_message(msg: dict, notified_at: float) -> NewMintEvent | None:
@@ -76,6 +77,7 @@ def parse_create_message(msg: dict, notified_at: float) -> NewMintEvent | None:
         virtual_tokens_in_curve=msg.get("vTokensInBondingCurve", 1_073_000_000.0),
         notified_at=notified_at,
         is_mayhem_mode=bool(msg.get("is_mayhem_mode", False)),
+        uri=msg.get("uri", ""),
     )
 
 
@@ -93,6 +95,7 @@ def event_to_candidate(event: NewMintEvent) -> Candidate:
         creator_supply_fraction=creator_supply_fraction,
         curve=curve,
         is_mayhem_mode=event.is_mayhem_mode,
+        uri=event.uri,
     )
 
 

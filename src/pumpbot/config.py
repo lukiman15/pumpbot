@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -45,8 +45,25 @@ class Tier1FilterConfig(BaseModel):
     curve_completion_guard_fraction: float
 
 
+class Tier2FilterConfig(BaseModel):
+    enabled: bool
+    mode: str
+    min_socials: int
+    fetch_timeout_seconds: float
+    fail_closed: bool
+    cache_max_entries: int
+
+    @field_validator("mode")
+    @classmethod
+    def _validate_mode(cls, v: str) -> str:
+        if v not in ("enforce", "observe"):
+            raise ValueError(f"filters.tier2.mode must be 'enforce' or 'observe', got {v!r}")
+        return v
+
+
 class FiltersConfig(BaseModel):
     tier1: Tier1FilterConfig
+    tier2: Tier2FilterConfig
     creator_blocklist_path: str
     name_symbol_blocklist_path: str
 

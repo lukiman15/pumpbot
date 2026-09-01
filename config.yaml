@@ -42,6 +42,17 @@ filters:
     max_creator_supply_fraction: 0.10
     max_mints_per_second: 5
     curve_completion_guard_fraction: 0.80
+  tier2:
+    enabled: true
+    mode: enforce
+    # min_socials: 1 matches the strongest-evidence cut in the source research
+    # (Telegram present vs absent, 8.94x graduation-rate difference). 3
+    # corresponds to the 17.4x figure but rejects far more flow -- revisit
+    # with local ledger data once Milestone 2 lands.
+    min_socials: 1
+    fetch_timeout_seconds: 0.8
+    fail_closed: false
+    cache_max_entries: 1000
   creator_blocklist_path: data/creator_blocklist.json
   name_symbol_blocklist_path: data/name_blocklist.txt
 

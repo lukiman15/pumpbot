@@ -40,6 +40,7 @@ import logging
 import time
 from pathlib import Path
 
+import httpx
 from solders.hash import Hash
 from solders.keypair import Keypair
 from solders.message import Message
@@ -70,6 +71,7 @@ from pumpbot.filters.tier1 import (
     load_creator_blocklist,
     load_name_symbol_blocklist,
 )
+from pumpbot.filters.tier2 import Tier2Filter
 from pumpbot.heartbeat import Heartbeat, HeartbeatReport
 from pumpbot.listener import MintListener
 from pumpbot.persistence import load_state, save_state
@@ -393,6 +395,7 @@ async def run_trader(
     position_manager: PositionManager,
     heartbeat: Heartbeat,
     state: TradingState,
+    tier2_filter: Tier2Filter,
 ) -> None:
     position_sol = settings.config.trading.position_sol
     position_sol_lamports = int(position_sol * LAMPORTS_PER_SOL)
@@ -410,6 +413,32 @@ async def run_trader(
         if not position_manager.can_open_new():
             logger.info("skip mint=%s: max_concurrent_positions reached", candidate.mint)
             continue
+
+        if settings.config.filters.tier2.enabled:
+            t0 = time.monotonic()
+            tier2_result = await tier2_filter.evaluate(candidate)
+            fetch_s = time.monotonic() - t0
+            socials_count = sum(
+                [tier2_result.has_twitter, tier2_result.has_telegram, tier2_result.has_website]
+            )
+            # This is the only record of a tier2 evaluation until Milestone 2
+            # promotes it to a Tier2Evaluated ledger event -- it must carry
+            # the full outcome category, not merely the pass/fail bit.
+            logger.info(
+                "tier2 mint=%s outcome=%s passed=%s socials=%d fetch_s=%.3f",
+                candidate.mint, tier2_result.outcome.value, tier2_result.passed,
+                socials_count, fetch_s,
+            )
+            if not tier2_result.passed:
+                # A tier2 reject is not an execution failure -- a token
+                # simply lacking a Telegram link is a normal outcome, not
+                # evidence the bot is broken. Do NOT call record_failure()
+                # here: that would halt entries after three link-less
+                # tokens in a row.
+                logger.info(
+                    "reject mint=%s reason=tier2_%s", candidate.mint, tier2_result.outcome.value
+                )
+                continue
 
         try:
             would_succeed, tokens_out_raw, error, is_transient, token_program_id = await _simulate_buy(
@@ -670,7 +699,7 @@ async def main() -> None:
     settings = load_settings()
     keypair = _load_keypair(settings.secrets.wallet_keypair_path)
 
-    async with RpcClient(settings) as rpc:
+    async with RpcClient(settings) as rpc, httpx.AsyncClient() as tier2_http_client:
         wallet_pubkey = await preflight(settings, rpc, keypair)
 
         creator_blocklist = load_creator_blocklist(
@@ -682,6 +711,7 @@ async def main() -> None:
         tier1_filter = Tier1Filter(
             settings.config.filters.tier1, creator_blocklist, name_symbol_blocklist
         )
+        tier2_filter = Tier2Filter(settings.config.filters.tier2, tier2_http_client)
 
         queue: asyncio.Queue[Candidate] = asyncio.Queue(maxsize=CANDIDATE_QUEUE_MAXSIZE)
         listener = MintListener(tier1_filter, queue)
@@ -727,7 +757,10 @@ async def main() -> None:
 
         await asyncio.gather(
             listener.run(),
-            run_trader(settings, rpc, keypair, wallet_pubkey, queue, position_manager, heartbeat, state),
+            run_trader(
+                settings, rpc, keypair, wallet_pubkey, queue, position_manager, heartbeat,
+                state, tier2_filter,
+            ),
             run_position_monitor(settings, rpc, keypair, wallet_pubkey, position_manager, heartbeat, state),
             run_reconciliation(settings, rpc, wallet_pubkey),
             heartbeat.run_forever(lambda: position_manager.open_count, _on_heartbeat),

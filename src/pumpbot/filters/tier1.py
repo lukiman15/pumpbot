@@ -51,6 +51,9 @@ class Candidate:
     # evidently require a different, gated fee_recipient this project's
     # plain wallet doesn't have -- see filters/tier1.py's evaluate().
     is_mayhem_mode: bool = False
+    # Metadata JSON URI, unused by tier1 (no I/O here) -- carried through
+    # for tier2.py's social-metadata gate. See filters/tier2.py.
+    uri: str = ""
 
 
 def load_creator_blocklist(path: str | Path) -> set[str]:
