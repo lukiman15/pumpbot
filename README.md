@@ -71,12 +71,39 @@ yet -- wiring it into `run_trader`/`run_position_monitor` and flipping
 themselves, not something this codebase should do on its own. `main()`
 still refuses to start with `DRY_RUN=false` until that wiring exists.
 
-Still needed before that wiring makes sense:
-- ATA lifecycle: `submit.py` doesn't yet decide *when* to close a position's
-  ATA after a full exit (rent recovery) -- that's a `main.py`-level policy
-  question, not a `submit.py` one.
+## ATA close-after-exit policy: built, not yet wired into the live loop
+
+`src/pumpbot/ata_close.py`'s `close_ata_after_exit` recovers a position's
+token-account rent (~0.002 SOL) once it's been fully exited. Not
+fund-critical by construction: SPL Token's `CloseAccount` instruction
+refuses on-chain if the account's balance is nonzero, so there is no way
+for this to destroy tokens by closing too early -- worst case, closing
+just fails and the rent stays forfeited.
+
+Design choices:
+- **Re-checks the real on-chain balance itself** before ever attempting a
+  close, rather than trusting the caller's belief that a position is fully
+  exited -- pump.fun's bonding-curve rounding and this project's own
+  tracked position state (`positions.py`) can drift by dust from the real
+  balance.
+- **A separate transaction from the final sell, not bundled into it** --
+  bundling would require knowing in advance the sell empties the account
+  to exactly zero, which the dust-drift point above makes unsafe to assume.
+- **Retries a bounded number of times** (`execution.ata_close_max_retries`,
+  already existed in config) on either a nonzero balance or a failed send
+  (any of `submit.py`'s four error types), then **gives up quietly** --
+  logs and returns `None`, never raises. A failed rent recovery must never
+  block a position from being considered closed or halt new trading.
+
+Covered by `tests/test_ata_close.py` against a scripted fake RPC -- no real
+network call or funds in any test.
+
+Still needed before wiring the full live loop makes sense:
+- Deciding *when* `main.py` calls `close_ata_after_exit` -- right after
+  `position.tokens_remaining` hits 0 in `run_position_monitor`, once real
+  sells replace the current `_simulate` calls.
 - Real integration into `run_trader`/`run_position_monitor` in place of the
-  `_simulate` calls, once the item above exists.
+  `_simulate` calls.
 
 ## Status
 
