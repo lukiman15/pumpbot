@@ -141,25 +141,27 @@ SELL_ACCOUNTS order (16 accounts, not 18 -- see below):
   12 fee_config                   -- shifted up from buy's [14] because sell
                                      has no volume-accumulator accounts at all
   13 fee_program                  -- shifted up from buy's [15]
-  14 UNKNOWN IDENTITY -- the same kind of slot as buy's [16] was before it
-      got resolved (not the same VALUE): across samples it's constant for a
-      given (user, mint) pair and varies when either changes, and likewise
-      never exists on-chain despite being referenced by successful
-      transactions. UNLIKE buy's [16], the obvious next guess --
-      derive_bonding_curve_v2_pda(mint), i.e. buy's exact resolved formula
-      -- does NOT reproduce this position's value from this module's
-      committed historical sell sample. That's a real, checked mismatch,
-      not just "unverified": sell's remaining-account slot is evidently a
-      different account, seeded differently (plausibly still bonding-curve-
-      v2-related but keyed by user as well as mint, given the observed
-      per-(user,mint) variation), or an unrelated concept entirely. Not
-      guessed further. An older simulateTransaction test (against an
-      already-established mint, not a brand-new one) found an arbitrary
-      value here still ran sell end-to-end with `err: null` -- but given
-      buy's equivalent slot turned out to matter for brand-new mints
-      specifically, that result should not be trusted the same way it once
-      was until re-tested against a brand-new mint's sell the same way
-      buy was.
+  14 UNKNOWN IDENTITY, CONFIRMED UNVALIDATED -- unlike buy's [16], this slot's
+      real identity is still not known (no PDA/ATA hypothesis reproduces this
+      module's committed historical sell sample's value -- ~10 hypotheses
+      tried and exhausted, including every seed combination of mint/user/
+      creator against both derive_bonding_curve_v2_pda's exact formula and
+      plausible per-(user,mint) variants). What IS now confirmed, closing
+      the caveat from the previous pass: a completely random, freshly
+      generated pubkey placed in this slot on a live sell simulation against
+      a BRAND-NEW mint (not an already-established one, which is what the
+      old, now-superseded test used) runs straight past this slot with no
+      error and proceeds into pump.fun's real business logic
+      (`NotEnoughTokensToSell`, Custom 6023 -- the genuine balance check).
+      Confirmed twice independently: two different brand-new mints, two
+      different random pubkeys, both times sailing past [14] with zero
+      validation. This is the same technique that resolved buy's [16] (force
+      an error and read what pump.fun's own program says) -- the difference
+      is buy's program DOES validate its slot (raises InvalidBondingCurveV2
+      when wrong) and sell's does NOT, so sell's real error surfaces past it
+      instead of naming this slot. Safe to submit an arbitrary value here on
+      a real send -- verified against brand-new mints specifically, not just
+      inherited from the old established-mint test.
   15 buyback_fee_recipient       -- confirmed against pump.fun's published
       "Buyback Fee Recipients" list (FEE_RECIPIENTS.md), same role as buy's
       [17]
@@ -382,10 +384,11 @@ def verify() -> None:
     print("bonding_curve_v2 (derive_bonding_curve_v2_pda), verified against a")
     print("committed historical sample AND live simulateTransaction on two")
     print("brand-new mints. 15-16 of sell's 16 accounts confirmed (see module")
-    print("docstring); sell's [14] remains unresolved -- buy's resolved formula")
-    print("does NOT reproduce it. Sell is NOT symmetric with buy: creator_vault/")
-    print("token_program are swapped, and sell has no volume-accumulator")
-    print("accounts at all (16 vs 18).")
+    print("docstring); sell's [14] identity remains unknown, but is confirmed")
+    print("UNVALIDATED on brand-new mints (two independent live simulate")
+    print("samples with a random pubkey both sailed past it with zero error).")
+    print("Sell is NOT symmetric with buy: creator_vault/token_program are")
+    print("swapped, and sell has no volume-accumulator accounts at all (16 vs 18).")
     print()
     print("RESOLVED, not an account-ordering problem: pump.fun's Buy logic")
     print("rejects fee_recipient with NotAuthorized (Custom 6000) for ALL")

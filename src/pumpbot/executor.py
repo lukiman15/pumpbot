@@ -7,18 +7,17 @@ transaction (fee payer, recent blockhash, signing, submission, confirmation
 polling per config.yaml's execution.* settings) is a separate, larger piece
 of work not covered here.
 
-Status: 17 of 18 buy accounts are confirmed, and sell has its own
-independently-confirmed 16-account layout (NOT symmetric with buy -- see
-program.py's module docstring). Both layouts have one account of unknown
-identity (buy's [16], sell's [14] -- same kind of gap, different position
-and value) that no PDA/ATA hypothesis reproduces. That no longer blocks
-sending real transactions: simulateTransaction against live chain state
-confirms the current on-chain program doesn't validate this account's
-identity for either instruction -- an arbitrary, freshly generated pubkey
-runs the full buy/sell end-to-end with `err: null`. Both build functions
-still require it as an explicit `unresolved_account` parameter with no
-default, not because an arbitrary value is risky (it's been shown not to
-be, by simulation) but because a future program upgrade could start
+Status: all 18 of buy's accounts are confirmed, including [16] -- resolved
+as bonding_curve_v2 (see program.py's module docstring). Sell has its own
+independently-confirmed 16-account layout (NOT symmetric with buy). Sell's
+[14] is the one remaining gap: its identity is still unknown (no PDA/ATA
+hypothesis reproduces it), but it's confirmed UNVALIDATED by live
+simulateTransaction against brand-new mints (two independent samples, a
+random pubkey both times) -- the on-chain program never checks it, unlike
+buy's [16] which does raise InvalidBondingCurveV2 when wrong. Both build
+functions still require their unresolved_account as an explicit parameter
+with no default -- not because an arbitrary value is risky for sell (it's
+confirmed not to be) but because a future program upgrade could start
 validating it, and a silent default would hide that when it happens.
 simulateTransaction is not the same as an actual send, though -- run every
 transaction through simulateTransaction immediately before sending until
@@ -219,10 +218,21 @@ def build_sell_instruction(
     16 accounts, not 18 (no volume-accumulator accounts at all), and
     creator_vault/token_program appear in the OPPOSITE order from buy.
 
-    fee_recipient/buyback_fee_recipient and unresolved_account carry the
-    same meaning as in build_buy_instruction -- see that docstring. Note
-    the *values* are not shared between a buy and sell of the same
-    trade; each must be resolved/supplied independently.
+    fee_recipient/buyback_fee_recipient carry the same meaning as in
+    build_buy_instruction -- see that docstring. Note the *values* are not
+    shared between a buy and sell of the same trade; each must be
+    resolved/supplied independently.
+
+    unresolved_account (position [14]) is DIFFERENT from buy's [16] in one
+    important way: buy's slot is validated by the on-chain program (wrong
+    value raises InvalidBondingCurveV2) and has a known identity
+    (bonding_curve_v2). Sell's slot's identity is still unknown -- no PDA/
+    ATA hypothesis reproduces it -- but is confirmed UNVALIDATED: two
+    independent live simulateTransaction samples against brand-new mints,
+    each with a random unrelated pubkey here, ran straight past this slot
+    into real business logic with no error referencing it at all. Safe to
+    submit any value. See program.py's module docstring for the full
+    account map and how this was confirmed.
     """
     global_pda = derive_global_pda()
     bonding_curve = derive_bonding_curve_pda(mint)

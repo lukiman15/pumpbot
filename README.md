@@ -142,3 +142,29 @@ fee_recipient might be, `filters/tier1.py`'s `Tier1Filter` now rejects
 MAYHEM_MODE_UNAUTHORIZED`) before they ever reach a buy simulation — see
 `Candidate.is_mayhem_mode`'s docstring. Wired through `listener.py`'s
 `NewMintEvent`/`event_to_candidate`.
+
+## Resolved: sell's account [14] is confirmed unvalidated (identity still unknown)
+
+The last open account-ordering item. ~10 PDA/ATA hypotheses were tried
+against this module's committed historical sell sample (every plausible
+seed combination of mint/user/creator, including buy's exact
+`bonding_curve_v2` formula and per-(user,mint) variants) — none reproduced
+it. Rather than keep guessing, this was resolved the same way buy's `[16]`
+was: force an error and read pump.fun's own program logs.
+
+A live sell `simulateTransaction` against a brand-new mint (with the
+create-ATA instruction bundled first, since a fresh wallet has no token
+account for a mint it's never bought), with a completely random, unrelated
+pubkey placed at `[14]`, ran straight past that slot with **zero error**
+and proceeded into real business logic — `NotEnoughTokensToSell` (`Custom:
+6023`), the genuine balance check. Confirmed twice independently, on two
+different brand-new mints with two different random pubkeys.
+
+This closes the caveat from the earlier pass: the *old* "safe to submit
+anything" claim for this slot was tested only against an already-established
+mint, before the discovery that buy's equivalent slot (`bonding_curve_v2`)
+turned out to matter specifically for brand-new mints. Sell's slot does
+**not** have that same brand-new-mint-specific behavior — it's confirmed
+unvalidated by the current on-chain program regardless of mint age. Its
+real identity is still unknown, but that no longer matters for safety: an
+arbitrary value is verified safe to submit for a real sell.
