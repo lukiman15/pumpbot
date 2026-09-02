@@ -169,6 +169,110 @@ def test_print_report_mixed_keeps_populations_separate(capsys):
     assert "(n=1)" in out or "n=1" in out
 
 
+# --- PHASE-1-RERUN-HANDOFF.md Task 3: arm/reason breakdown, tier-1/tier-2 ---
+
+
+def _shadow(mint, arm, reject_reason, ts_wall, horizon, ret, dry_run=False, trade_id=None):
+    return _envelope(
+        "ShadowPrice", dry_run, ts_wall, mint=mint, arm=arm, reject_reason=reject_reason,
+        horizon_elapsed_seconds=horizon, price_sol=0.000001, return_from_first_seen=ret,
+        curve_complete=False, trade_id=trade_id,
+    )
+
+
+def test_adverse_selection_by_arm_groups_by_arm_and_reject_reason():
+    events = [
+        _shadow("M1", "skipped", "entries_halted", 1000.0, 10.0, 0.10),
+        _shadow("M2", "skipped", "tier2_rejected", 1000.0, 10.0, -0.20),
+        _shadow("M3", "bought", None, 1000.0, 10.0, 0.05),
+    ]
+    grouped = report.adverse_selection_by_arm(events)
+    assert grouped[("skipped", "entries_halted")] == [0.10]
+    assert grouped[("skipped", "tier2_rejected")] == [-0.20]
+    assert grouped[("bought", None)] == [0.05]
+
+
+def test_tier1_effect_control_is_bought_plus_skipped_any_reason():
+    events = [
+        _shadow("M1", "rejected", "creator_supply_too_high", 1000.0, 10.0, -0.30),
+        _shadow("M2", "bought", None, 1000.0, 10.0, 0.05),
+        _shadow("M3", "skipped", "tier2_rejected", 1000.0, 10.0, 0.02),
+    ]
+    grouped = report.adverse_selection_by_arm(events)
+    t1 = report.tier1_effect(grouped)
+    assert t1["rejected"] == [-0.30]
+    assert sorted(t1["tier1_passing_control"]) == [0.02, 0.05]
+
+
+def test_tier2_marginal_effect_control_excludes_tier2_rejected_and_sim_would_fail():
+    events = [
+        _shadow("M1", "bought", None, 1000.0, 10.0, 0.05),
+        _shadow("M2", "skipped", "entries_halted", 1000.0, 10.0, 0.01),
+        _shadow("M3", "skipped", "max_concurrent_positions", 1000.0, 10.0, 0.02),
+        _shadow("M4", "skipped", "tier2_rejected", 1000.0, 10.0, -0.50),
+        _shadow("M5", "skipped", "sim_would_fail_race", 1000.0, 10.0, 0.99),
+        _shadow("M6", "skipped", "sim_would_fail_structural", 1000.0, 10.0, 0.99),
+    ]
+    grouped = report.adverse_selection_by_arm(events)
+    t2 = report.tier2_marginal_effect(grouped)
+    assert t2["bought"] == [0.05]
+    assert sorted(t2["tier2_unjudged_control"]) == [0.01, 0.02]
+
+
+def test_shadow_saturation_estimate_detects_overlap_at_capacity():
+    # Two mints tracked concurrently (overlapping intervals), max_tracked=2
+    # -- peak_concurrent should reach 2, marking saturation.
+    events = [
+        _shadow("M1", "skipped", "entries_halted", 1000.0, 0.0, None),
+        _shadow("M1", "skipped", "entries_halted", 1010.0, 10.0, 0.01),
+        _shadow("M2", "skipped", "entries_halted", 1005.0, 0.0, None),
+        _shadow("M2", "skipped", "entries_halted", 1015.0, 10.0, 0.02),
+    ]
+    sat = report.shadow_saturation_estimate(events, max_tracked=2)
+    assert sat["n_mints"] == 2
+    assert sat["peak_concurrent"] == 2
+    assert sat["saturated"] is True
+
+
+def test_shadow_saturation_estimate_below_capacity_not_saturated():
+    events = [
+        _shadow("M1", "skipped", "entries_halted", 1000.0, 0.0, None),
+        _shadow("M1", "skipped", "entries_halted", 1010.0, 10.0, 0.01),
+    ]
+    sat = report.shadow_saturation_estimate(events, max_tracked=50)
+    assert sat["n_mints"] == 1
+    assert sat["saturated"] is False
+
+
+def test_shadow_saturation_estimate_empty_ledger_is_n_zero_safe():
+    sat = report.shadow_saturation_estimate([], max_tracked=50)
+    assert sat == {"n_mints": 0, "peak_concurrent": 0, "saturated": False}
+
+
+def test_print_report_names_the_control_for_each_comparison_and_marks_insufficient_sample(capsys):
+    events = [
+        _shadow("M1", "rejected", "creator_supply_too_high", 1000.0, 10.0, -0.30),
+        _shadow("M2", "bought", None, 1000.0, 10.0, 0.05),
+        _shadow("M3", "skipped", "entries_halted", 1000.0, 10.0, 0.02),
+        _shadow("M4", "skipped", "tier2_rejected", 1000.0, 10.0, -0.50),
+    ]
+    report.print_report(events)
+    out = capsys.readouterr().out
+    assert "TIER-1 effect" in out
+    assert "TIER-2 marginal effect" in out
+    assert "tier1_passing_control" in out
+    assert "tier2_unjudged_control" in out
+    # Every group here is far below MIN_SAMPLE_FOR_STATS (30).
+    assert "INSUFFICIENT SAMPLE" in out
+    assert "shadow saturation" in out
+
+
+def test_print_report_no_shadow_price_rows_does_not_crash():
+    # No ShadowPrice rows at all (shadow.enabled: false during the run) --
+    # every new section must be n==0 safe.
+    report.print_report(make_real_events())
+
+
 def test_load_closed_real_trades_still_raises_on_null_pnl_for_a_real_trade():
     # Guards against a future edit accidentally loosening this: a REAL
     # TradeClosed with a null PnL field is a settlement bug, not a

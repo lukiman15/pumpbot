@@ -228,24 +228,130 @@ def trade_status_counts(events: list[dict[str, Any]]) -> Counter[str]:
 # --- adverse selection: shadow log by arm ---------------------------------
 
 
-def adverse_selection_by_arm(events: list[dict[str, Any]]) -> dict[str, list[float]]:
+def _latest_shadow_price_by_mint(events: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """The last ShadowPrice per mint (highest horizon_elapsed_seconds) is
-    that mint's at-horizon (or at-graduation) forward return."""
-    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    that mint's at-horizon (or at-graduation) forward return. A mint is
+    tracked under exactly one arm for its whole life (ShadowTracker.track
+    is idempotent once a mint is admitted), so keying by mint alone is
+    safe -- (arm, mint) would be equivalent."""
+    latest: dict[str, dict[str, Any]] = {}
     for row in events:
         if row.get("event") != "ShadowPrice":
             continue
-        key = (row["arm"], row["mint"])
-        existing = latest.get(key)
+        mint = row["mint"]
+        existing = latest.get(mint)
         if existing is None or row["horizon_elapsed_seconds"] > existing["horizon_elapsed_seconds"]:
-            latest[key] = row
+            latest[mint] = row
+    return latest
 
-    by_arm: dict[str, list[float]] = defaultdict(list)
-    for (arm, _mint), row in latest.items():
+
+def adverse_selection_by_arm(
+    events: Iterable[dict[str, Any]],
+) -> dict[tuple[str, str | None], list[float]]:
+    """Groups the final ShadowPrice per mint by (arm, reject_reason) --
+    NOT arm alone. The `skipped` arm mixes four unrelated reasons
+    (entries_halted, max_concurrent_positions, tier2_rejected,
+    sim_would_fail_race/structural) that answer different questions, and
+    lumping them together produced a misread evidence pack
+    (PHASE-1-RERUN-HANDOFF.md Section 2.4): bought vs all-of-rejected looks
+    like a tier-2 result, but the two arms differ by tier-1, tier-2, AND
+    simulation all at once. See tier1_effect/tier2_marginal_effect below
+    for the comparisons that actually isolate one question each."""
+    by_arm_reason: dict[tuple[str, str | None], list[float]] = defaultdict(list)
+    for row in _latest_shadow_price_by_mint(events).values():
         ret = row.get("return_from_first_seen")
         if ret is not None:
-            by_arm[arm].append(ret)
-    return by_arm
+            by_arm_reason[(row["arm"], row.get("reject_reason"))].append(ret)
+    return dict(by_arm_reason)
+
+
+# The tier-2 gate hasn't judged a candidate that was skipped for one of
+# these two reasons -- it never reached tier-2 at all. Deliberately an
+# allowlist: `tier2_rejected` is the thing being measured (excluding it),
+# and `sim_would_fail_race`/`sim_would_fail_structural` are plausibly
+# biased toward CONTESTED tokens (something else wanted them badly enough
+# to move the price first), so folding them into the control would bias
+# it. PHASE-1-RERUN-HANDOFF.md Section 3, Task 3.
+TIER2_UNJUDGED_SKIP_REASONS = frozenset({"entries_halted", "max_concurrent_positions"})
+
+
+def tier1_effect(
+    by_arm_reason: dict[tuple[str, str | None], list[float]],
+) -> dict[str, list[float]]:
+    """Control: tier-1-passing flow (bought + skipped, any reason -- both
+    arms passed tier-1 by construction). Answers whether tier-1's own
+    reject reasons (creator_supply_too_high, mint_rate_too_high --
+    mayhem_mode_unauthorized is excluded upstream, see shadow.py) are
+    filtering out mints that would have done worse anyway."""
+    rejected = [r for (arm, _reason), rets in by_arm_reason.items() if arm == "rejected" for r in rets]
+    tier1_passing = [
+        r for (arm, _reason), rets in by_arm_reason.items() if arm in ("bought", "skipped") for r in rets
+    ]
+    return {"rejected": rejected, "tier1_passing_control": tier1_passing}
+
+
+def tier2_marginal_effect(
+    by_arm_reason: dict[tuple[str, str | None], list[float]],
+) -> dict[str, list[float]]:
+    """Control: TIER2_UNJUDGED_SKIP_REASONS only -- flow that passed tier-1
+    but never reached a tier-2 verdict, not the general skipped bucket.
+    Answers whether the tier-2 social gate adds anything ON TOP of tier-1,
+    which `rejected` (tier-1-failing) cannot isolate."""
+    bought = [r for (arm, _reason), rets in by_arm_reason.items() if arm == "bought" for r in rets]
+    control = [
+        r
+        for (arm, reason), rets in by_arm_reason.items()
+        if arm == "skipped" and reason in TIER2_UNJUDGED_SKIP_REASONS
+        for r in rets
+    ]
+    return {"bought": bought, "tier2_unjudged_control": control}
+
+
+def shadow_saturation_estimate(
+    events: Iterable[dict[str, Any]], max_tracked: int
+) -> dict[str, Any]:
+    """Estimates peak CONCURRENT shadow-tracked mints from ShadowPrice
+    rows' (ts_wall, horizon_elapsed_seconds) pairs. ShadowTracker itself
+    (shadow.py) keeps no record of track() calls silently dropped for
+    len(_tracked) >= max_tracked (PHASE-1-RERUN-HANDOFF.md Section 2.5),
+    so this reconstructs each mint's active interval from the ledger
+    alone -- [first_ts_wall - its own horizon offset, last_ts_wall] -- and
+    sweeps for the maximum overlap. Once that estimated peak reaches
+    max_tracked, further admissions in that stretch were dropped and the
+    sample stops being random (first-come instead)."""
+    per_mint_rows: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for row in events:
+        if row.get("event") != "ShadowPrice":
+            continue
+        mint = row.get("mint")
+        ts_wall = row.get("ts_wall")
+        horizon = row.get("horizon_elapsed_seconds")
+        if mint is None or ts_wall is None or horizon is None:
+            continue
+        per_mint_rows[mint].append((ts_wall, horizon))
+
+    if not per_mint_rows:
+        return {"n_mints": 0, "peak_concurrent": 0, "saturated": False}
+
+    boundaries: list[tuple[float, int]] = []
+    for rows in per_mint_rows.values():
+        start = min(ts - h for ts, h in rows)
+        end = max(ts for ts, _h in rows)
+        boundaries.append((start, 1))
+        boundaries.append((end, -1))
+    boundaries.sort()
+
+    concurrent = 0
+    peak = 0
+    for _ts, delta in boundaries:
+        concurrent += delta
+        peak = max(peak, concurrent)
+
+    return {
+        "n_mints": len(per_mint_rows),
+        "peak_concurrent": peak,
+        "saturated": peak >= max_tracked,
+    }
 
 
 def tier2_outcome_report(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -403,6 +509,19 @@ def _fmt_lamports(n: float | None) -> str:
     if n is None:
         return "n/a"
     return f"{n / 1_000_000_000:.6f} SOL ({n:.0f} lamports)"
+
+
+def _print_arm_comparison(label: str, returns: list[float]) -> None:
+    """Reuses MIN_SAMPLE_FOR_STATS as the same insufficient-sample floor
+    used everywhere else in this script -- two different evidence bars in
+    one project invites arguing about which applies (see
+    DEFERRED-exit-threshold-retune.md's identical reasoning for reusing
+    min_closed_trades_before_sizeup)."""
+    n = len(returns)
+    if n < MIN_SAMPLE_FOR_STATS:
+        print(f"    {label}: INSUFFICIENT SAMPLE (n={n})")
+    else:
+        print(f"    {label}: median={statistics.median(returns):+.1%} (n={n})")
 
 
 def print_report(all_events: list[dict[str, Any]]) -> None:
@@ -596,17 +715,52 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
         )
 
     print()
-    print("=== Adverse selection: median forward return by arm (ALL events, incl. dry-run) ===")
-    by_arm = adverse_selection_by_arm(all_events)
-    if not by_arm:
+    print("=== Adverse selection (ALL events, incl. dry-run) ===")
+    by_arm_reason = adverse_selection_by_arm(all_events)
+    if not by_arm_reason:
         print("  n/a -- no ShadowPrice rows in this ledger (shadow.enabled: false?)")
     else:
-        for arm in ("bought", "rejected", "skipped"):
-            returns = by_arm.get(arm, [])
-            if not returns:
-                print(f"  {arm}: n/a (n=0)")
-            else:
-                print(f"  {arm}: median={statistics.median(returns):+.1%} (n={len(returns)})")
+        print("  -- full breakdown by (arm, reject_reason) --")
+        for (arm, reason), returns in sorted(
+            by_arm_reason.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")
+        ):
+            label = f"{arm}[{reason}]" if reason is not None else arm
+            print(f"  {label}: median={statistics.median(returns):+.1%} (n={len(returns)})")
+
+        print()
+        print(
+            "  -- TIER-1 effect: control = tier1_passing (bought + skipped, any "
+            "reason -- both passed tier-1) --"
+        )
+        t1 = tier1_effect(by_arm_reason)
+        _print_arm_comparison("rejected", t1["rejected"])
+        _print_arm_comparison("tier1_passing_control", t1["tier1_passing_control"])
+
+        print()
+        print(
+            "  -- TIER-2 marginal effect: control = tier2_unjudged (skipped: "
+            "entries_halted/max_concurrent_positions only -- excludes "
+            "tier2_rejected and sim_would_fail_*) --"
+        )
+        t2 = tier2_marginal_effect(by_arm_reason)
+        _print_arm_comparison("bought", t2["bought"])
+        _print_arm_comparison("tier2_unjudged_control", t2["tier2_unjudged_control"])
+
+    print()
+    saturation = shadow_saturation_estimate(all_events, settings.config.shadow.max_tracked)
+    if saturation["n_mints"] == 0:
+        print("  shadow saturation: n/a (no ShadowPrice rows)")
+    else:
+        verdict = (
+            "LIKELY -- sample is first-come, not random"
+            if saturation["saturated"]
+            else "not reached -- sample should be representative"
+        )
+        print(
+            f"  shadow saturation: peak_concurrent~={saturation['peak_concurrent']} vs "
+            f"max_tracked={settings.config.shadow.max_tracked} "
+            f"(n_mints_tracked={saturation['n_mints']}) -- {verdict}"
+        )
 
 
 def main() -> None:
