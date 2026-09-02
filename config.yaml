@@ -159,8 +159,23 @@ execution:
 
 failsafe:
   # Consecutive execution failures before dropping to exit-only mode (new entries
-  # halted, exits and reconciliation stay funded).
+  # halted, exits and reconciliation stay funded). Do not raise this to paper
+  # over frequent halts -- PHASE-1-RERUN-HANDOFF.md Section 2.2 measured a 54%
+  # buy-simulation failure rate live and found scaling the limit either does
+  # nothing (5) or defeats the failsafe for real failures (10). Classify the
+  # failures instead (see main.py's buy/sell error classifiers).
   consecutive_failure_limit: 3
+  # A threshold halt (the limit above) is a heuristic guess, not proof
+  # something is broken -- it auto-resumes after this many quiet seconds
+  # with no further counted failure. 300s matches one exit-timeout's worth
+  # of quiet.
+  halt_recovery_seconds: 300
+  # Bounded: after this many auto-recoveries in one process, repeated
+  # halting is itself a signal, and the halt goes permanent (CRITICAL) --
+  # a human is genuinely needed at that point. Does NOT apply to
+  # halt_entries_immediately's sticky halt (a real send with an UNKNOWN
+  # outcome), which never auto-recovers regardless of this value.
+  max_auto_recoveries: 3
 
 probe:
   default_hours: 1

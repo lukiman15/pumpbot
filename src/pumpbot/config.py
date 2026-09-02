@@ -139,6 +139,17 @@ class ExecutionConfig(BaseModel):
 
 class FailsafeConfig(BaseModel):
     consecutive_failure_limit: int
+    # A record_failure() threshold halt (a heuristic guess) auto-resumes
+    # after this many quiet seconds with no further counted failure --
+    # distinct from halt_entries_immediately's sticky halt (a real send
+    # whose outcome is UNKNOWN), which no timer ever clears. See
+    # TradingState in main.py. PHASE-1-RERUN-HANDOFF.md Section 3.2.
+    halt_recovery_seconds: float
+    # Bounds how many times one process will auto-resume from a threshold
+    # halt before treating repeated halting as its own signal and going
+    # permanent. 0 disables auto-recovery entirely (matches the pre-Phase-1
+    # -rerun behavior).
+    max_auto_recoveries: int
 
 
 class ProbeConfig(BaseModel):

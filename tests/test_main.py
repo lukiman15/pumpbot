@@ -889,3 +889,77 @@ async def test_three_consecutive_buy_race_errors_do_not_halt_entries(tmp_path):
     ledger.close()
     assert state._consecutive_failures == 0
     assert state.entries_halted is False
+
+
+# --- PHASE-1-RERUN-HANDOFF.md Task 2: recoverable vs permanent halts ---
+
+
+def test_threshold_halt_auto_recovers_after_quiet_period(monkeypatch):
+    t = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: t[0])
+    state = TradingState(halt_recovery_seconds=10.0, max_auto_recoveries=3)
+
+    state.record_failure(3)
+    state.record_failure(3)
+    state.record_failure(3)
+    assert state.entries_halted is True
+
+    t[0] += 10.0
+    assert state.entries_halted is False
+
+
+def test_counted_failure_during_quiet_period_restarts_the_clock(monkeypatch):
+    t = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: t[0])
+    state = TradingState(halt_recovery_seconds=10.0, max_auto_recoveries=3)
+
+    state.record_failure(3)
+    state.record_failure(3)
+    state.record_failure(3)
+    assert state.entries_halted is True
+
+    t[0] += 9.0
+    state.record_failure(3)  # restarts the clock -- quiet period wasn't actually quiet
+    t[0] += 9.0  # 18s since the ORIGINAL trip (would have cleared), only 9s since the restart
+    assert state.entries_halted is True
+
+    t[0] += 2.0  # 11s since the restart
+    assert state.entries_halted is False
+
+
+def test_halt_becomes_permanent_after_max_auto_recoveries(monkeypatch):
+    t = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: t[0])
+    state = TradingState(halt_recovery_seconds=10.0, max_auto_recoveries=2)
+
+    for _ in range(2):
+        state.record_failure(3)
+        state.record_failure(3)
+        state.record_failure(3)
+        assert state.entries_halted is True
+        t[0] += 10.0
+        assert state.entries_halted is False  # auto-recovered
+
+    # Third trip exhausts the 2 allowed recoveries -- must go permanent.
+    state.record_failure(3)
+    state.record_failure(3)
+    state.record_failure(3)
+    assert state.entries_halted is True
+    t[0] += 10.0
+    assert state.entries_halted is True  # does NOT auto-recover a 3rd time
+    t[0] += 1_000_000.0
+    assert state.entries_halted is True
+
+
+def test_halt_entries_immediately_never_auto_recovers(monkeypatch):
+    t = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: t[0])
+    # Generous recovery settings -- proves the sticky flag ignores them
+    # entirely, not merely that these particular values weren't reached.
+    state = TradingState(halt_recovery_seconds=1.0, max_auto_recoveries=100)
+
+    state.halt_entries_immediately("real send outcome UNKNOWN")
+    assert state.entries_halted is True
+
+    t[0] += 1_000_000.0
+    assert state.entries_halted is True

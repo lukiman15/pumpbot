@@ -138,9 +138,25 @@ class TradingState:
     """Mutable state shared between the trader, monitor, and reconciliation
     tasks that doesn't belong inside PositionManager itself."""
 
-    def __init__(self) -> None:
-        self.entries_halted = False
+    def __init__(self, halt_recovery_seconds: float = float("inf"), max_auto_recoveries: int = 0) -> None:
+        # Defaults preserve the pre-Phase-1-rerun behavior for callers that
+        # don't pass real failsafe config (existing tests, mainly): 0 allowed
+        # auto-recoveries means a threshold halt never auto-clears, matching
+        # the old permanent-halt-only semantics exactly.
+        self._halt_recovery_seconds = halt_recovery_seconds
+        self._max_auto_recoveries = max_auto_recoveries
         self._consecutive_failures = 0
+        # Set when record_failure's threshold trips a halt; cleared on
+        # auto-recovery. None means "not currently threshold-halted" --
+        # tracked separately from _permanently_halted below, which this
+        # clock never governs (PHASE-1-RERUN-HANDOFF.md Section 3.2).
+        self._threshold_halted_at: float | None = None
+        self._auto_recoveries_used = 0
+        # Sticky: set by halt_entries_immediately (a real send whose
+        # outcome is UNKNOWN) or once max_auto_recoveries is exhausted.
+        # No timer or recovery count ever clears this -- a human is
+        # required either way.
+        self._permanently_halted = False
         self._creators: dict[str, str] = {}
         # token_program_id doesn't change over a mint's lifetime -- once a
         # buy confirms it, a sell of the same mint can reuse it directly
@@ -164,14 +180,53 @@ class TradingState:
         self._creator_ata_baseline: dict[str, int] = {}
         self._creator_ata_poll_done: set[str] = set()
 
+    @property
+    def entries_halted(self) -> bool:
+        self._maybe_recover()
+        return self._permanently_halted or self._threshold_halted_at is not None
+
+    def _maybe_recover(self) -> None:
+        if self._threshold_halted_at is None or self._permanently_halted:
+            return
+        if self._auto_recoveries_used >= self._max_auto_recoveries:
+            # Bounded: every allowed auto-recovery is spent. Repeated
+            # halting is itself a signal and must not be papered over
+            # indefinitely -- this halt is now permanent.
+            self._permanently_halted = True
+            logger.critical(
+                "failsafe: exhausted %d auto-recover(y/ies) -- halt is now "
+                "permanent, a human is needed",
+                self._max_auto_recoveries,
+            )
+            return
+        if time.monotonic() - self._threshold_halted_at >= self._halt_recovery_seconds:
+            self._threshold_halted_at = None
+            self._consecutive_failures = 0
+            self._auto_recoveries_used += 1
+            logger.warning(
+                "failsafe: %.0fs quiet period elapsed, auto-resuming new "
+                "entries (%d/%d auto-recoveries used)",
+                self._halt_recovery_seconds, self._auto_recoveries_used, self._max_auto_recoveries,
+            )
+
     def record_failure(self, limit: int) -> None:
         self._consecutive_failures += 1
-        if self._consecutive_failures >= limit and not self.entries_halted:
-            self.entries_halted = True
+        if self._permanently_halted:
+            return
+        if self._threshold_halted_at is not None:
+            # Still counting down the quiet period -- another counted
+            # failure means it hasn't actually been quiet, so restart the
+            # clock rather than let an earlier, unrelated failure count
+            # toward this one's recovery.
+            self._threshold_halted_at = time.monotonic()
+            return
+        if self._consecutive_failures >= limit:
+            self._threshold_halted_at = time.monotonic()
             logger.critical(
                 "failsafe: %d consecutive failures, halting new entries "
-                "(existing positions and reconciliation are unaffected)",
-                self._consecutive_failures,
+                "(existing positions and reconciliation are unaffected; "
+                "auto-resumes after %.0fs of quiet, up to %d time(s))",
+                self._consecutive_failures, self._halt_recovery_seconds, self._max_auto_recoveries,
             )
 
     def record_success(self) -> None:
@@ -181,12 +236,13 @@ class TradingState:
         """For a real send whose outcome is UNKNOWN (ConfirmationTimeoutError
         or an exhausted BlockhashExpiredError, see submit.py) -- distinct
         from record_failure's threshold-based halt, this halts on the very
-        first occurrence. An unknown real-money outcome is categorically
-        worse than a simulation that correctly predicted a failure; it
-        needs a human to reconcile the signature before any more entries,
-        not a few more chances first."""
-        if not self.entries_halted:
-            self.entries_halted = True
+        first occurrence and NEVER auto-recovers, no matter how much time
+        passes or how many recoveries remain (PHASE-1-RERUN-HANDOFF.md
+        Section 3.2). An unknown real-money outcome is categorically worse
+        than a simulation that correctly predicted a failure; it needs a
+        human to reconcile the signature before any more entries, not a
+        timer or a few more chances first."""
+        self._permanently_halted = True
         logger.critical("failsafe: halting new entries immediately -- %s", reason)
 
     def remember_creator(self, mint: str, creator: str) -> None:
@@ -1269,7 +1325,10 @@ async def main() -> None:
         listener = MintListener(tier1_filter, queue, ledger=ledger, shadow_tracker=shadow_tracker)
         position_manager = PositionManager(settings.config.trading.max_concurrent_positions)
         heartbeat = Heartbeat(settings.config.heartbeat)
-        state = TradingState()
+        state = TradingState(
+            halt_recovery_seconds=settings.config.failsafe.halt_recovery_seconds,
+            max_auto_recoveries=settings.config.failsafe.max_auto_recoveries,
+        )
 
         restored_positions, restored_creators, restored_token_programs = load_state(STATE_PATH)
         for position in restored_positions:
