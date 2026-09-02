@@ -584,6 +584,25 @@ async def _simulate_sell(
     return error, token_program_id
 
 
+# Anchor Custom program error 6002 == pump.fun's own TooMuchSolRequired: a
+# competing buy landed first and moved the curve past this attempt's
+# max_sol_cost. A real slippage rejection -- a market outcome, not evidence
+# this bot is broken (PHASE-1-RERUN-HANDOFF.md Section 3.1, confirmed live:
+# a 54% buy-simulation failure rate with this as the dominant cause, and
+# three-in-a-row at that rate is the EXPECTED outcome, not a tail event).
+# Allowlist, never denylist: 6063 (seen once before, per README.md, never
+# characterized) and anything else fall through to the counted branch --
+# silently swallowing an unrecognized error would suppress real breakage.
+# 6000 (NotAuthorized) is deliberately excluded: it already has its own
+# upstream handling via the mayhem_mode_unauthorized tier-1 reject and must
+# not be double-counted here.
+_BUY_RACE_ERROR_MARKERS = ("'Custom': 6002",)
+
+
+def _is_buy_race_error(error: str) -> bool:
+    return any(marker in error for marker in _BUY_RACE_ERROR_MARKERS)
+
+
 async def run_trader(
     settings: Settings,
     rpc: RpcClient,
@@ -724,13 +743,32 @@ async def run_trader(
                 shadow_tracker.track(
                     candidate.mint, arm="skipped", reject_reason="mint_not_visible"
                 )
-            else:
-                logger.info("simulated buy would fail mint=%s reason=%s", candidate.mint, error)
+            elif _is_buy_race_error(error):
+                # Race/market class: normal outcome, does not count toward
+                # the failsafe (PHASE-1-RERUN-HANDOFF.md Section 3.1).
+                logger.info(
+                    "simulated buy would fail mint=%s class=race reason=%s",
+                    candidate.mint, error,
+                )
                 ledger.append(
-                    CandidateSkipped(mint=candidate.mint, reason="sim_would_fail", detail=error)
+                    CandidateSkipped(mint=candidate.mint, reason="sim_would_fail_race", detail=error)
                 )
                 shadow_tracker.track(
-                    candidate.mint, arm="skipped", reject_reason="sim_would_fail"
+                    candidate.mint, arm="skipped", reject_reason="sim_would_fail_race"
+                )
+            else:
+                # Unrecognized/structural class: stays counted.
+                logger.warning(
+                    "simulated buy would fail mint=%s class=structural reason=%s",
+                    candidate.mint, error,
+                )
+                ledger.append(
+                    CandidateSkipped(
+                        mint=candidate.mint, reason="sim_would_fail_structural", detail=error
+                    )
+                )
+                shadow_tracker.track(
+                    candidate.mint, arm="skipped", reject_reason="sim_would_fail_structural"
                 )
                 state.record_failure(failure_limit)
             continue

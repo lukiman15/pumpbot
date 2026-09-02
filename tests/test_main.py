@@ -81,7 +81,9 @@ def load_test_settings(**fee_overrides) -> Settings:
     return settings
 
 
-async def _run_one_candidate(settings: Settings, ledger: Ledger, state: TradingState, candidate) -> None:
+async def _run_one_candidate(
+    settings: Settings, ledger: Ledger, state: TradingState, candidate, rpc=None
+) -> None:
     """Feeds exactly one candidate through run_trader and stops the loop
     once it has been handled (run_trader is an infinite consumer loop with
     no task_done signal to await, so this just gives it a beat to process
@@ -95,7 +97,7 @@ async def _run_one_candidate(settings: Settings, ledger: Ledger, state: TradingS
     task = asyncio.create_task(
         run_trader(
             settings,
-            rpc=None,
+            rpc=rpc,
             keypair=TEST_KEYPAIR,
             wallet_pubkey=TEST_KEYPAIR.pubkey(),
             queue=queue,
@@ -753,3 +755,137 @@ async def test_live_mode_sell_simulation_failure_still_records_failure(tmp_path)
     # monitor ticks fire within the test window -- the point is that the
     # live path still calls record_failure at all, unlike dry run.
     assert state._consecutive_failures >= 1
+
+
+# --- PHASE-1-RERUN-HANDOFF.md Task 1: buy-simulation failure classification ---
+
+_BUY_RACE_ERROR = {"InstructionError": [2, {"Custom": 6002}]}
+_BUY_STRUCTURAL_ERROR = {"InstructionError": [2, {"Custom": 6063}]}
+_BUY_UNRECOGNIZED_ERROR = {"SomeTotallyUnrelatedError": True}
+
+
+class _ScriptedBuyRpc:
+    """Fakes just enough of _simulate_buy's optimistic-then-resolved flow:
+    getAccountInfo (for resolve_token_program_id's fallback, once the
+    optimistic Token-2022 guess's simulation fails) and simulateTransaction
+    (returning the same scripted error both times, since the test only
+    cares about the final classified error)."""
+
+    def __init__(self, mint: Pubkey, token_program_id: Pubkey, sim_error: dict) -> None:
+        self._mint = str(mint)
+        self._token_program_id = str(token_program_id)
+        self._sim_error = sim_error
+        self.simulate_calls = 0
+
+    async def call(self, method, params=None, pool="trading"):
+        params = params or []
+        if method == "getAccountInfo" and params and params[0] == self._mint:
+            return {"value": {"owner": self._token_program_id, "data": ["", "base64"]}}
+        if method == "simulateTransaction":
+            self.simulate_calls += 1
+            return {"value": {"err": self._sim_error}}
+        raise AssertionError(f"unexpected rpc call: {method} {params}")
+
+
+@pytest.mark.asyncio
+async def test_buy_race_error_skips_and_does_not_touch_failsafe(tmp_path):
+    settings = load_test_settings()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    state = TradingState()
+    mint = str(Keypair().pubkey())
+    rpc = _ScriptedBuyRpc(Pubkey.from_string(mint), TOKEN_2022_PROGRAM_ID, _BUY_RACE_ERROR)
+
+    await _run_one_candidate(settings, ledger, state, make_candidate(mint), rpc=rpc)
+    ledger.close()
+
+    rows = list(read_events(tmp_path))
+    skip_rows = [r for r in rows if r.get("event") == "CandidateSkipped" and r.get("mint") == mint]
+    assert len(skip_rows) == 1
+    assert skip_rows[0]["reason"] == "sim_would_fail_race"
+    assert state._consecutive_failures == 0
+    assert state.entries_halted is False
+
+
+@pytest.mark.asyncio
+async def test_buy_structural_error_skips_and_increments_failsafe(tmp_path):
+    settings = load_test_settings()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    state = TradingState()
+    mint = str(Keypair().pubkey())
+    rpc = _ScriptedBuyRpc(Pubkey.from_string(mint), TOKEN_2022_PROGRAM_ID, _BUY_STRUCTURAL_ERROR)
+
+    await _run_one_candidate(settings, ledger, state, make_candidate(mint), rpc=rpc)
+    ledger.close()
+
+    rows = list(read_events(tmp_path))
+    skip_rows = [r for r in rows if r.get("event") == "CandidateSkipped" and r.get("mint") == mint]
+    assert len(skip_rows) == 1
+    assert skip_rows[0]["reason"] == "sim_would_fail_structural"
+    assert state._consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_buy_unrecognized_error_is_treated_as_structural_allowlist_behavior(tmp_path):
+    settings = load_test_settings()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    state = TradingState()
+    mint = str(Keypair().pubkey())
+    rpc = _ScriptedBuyRpc(Pubkey.from_string(mint), TOKEN_2022_PROGRAM_ID, _BUY_UNRECOGNIZED_ERROR)
+
+    await _run_one_candidate(settings, ledger, state, make_candidate(mint), rpc=rpc)
+    ledger.close()
+
+    rows = list(read_events(tmp_path))
+    skip_rows = [r for r in rows if r.get("event") == "CandidateSkipped" and r.get("mint") == mint]
+    assert skip_rows[0]["reason"] == "sim_would_fail_structural"
+    assert state._consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_buy_failure_classes_still_track_shadow_and_emit_skip(tmp_path, monkeypatch):
+    calls = []
+    original_track = ShadowTracker.track
+
+    def spy_track(self, mint, **kwargs):
+        calls.append((mint, kwargs.get("reject_reason")))
+        return original_track(self, mint, **kwargs)
+
+    monkeypatch.setattr(ShadowTracker, "track", spy_track)
+
+    settings = load_test_settings()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    state = TradingState()
+
+    mint_race = str(Keypair().pubkey())
+    rpc_race = _ScriptedBuyRpc(Pubkey.from_string(mint_race), TOKEN_2022_PROGRAM_ID, _BUY_RACE_ERROR)
+    await _run_one_candidate(settings, ledger, state, make_candidate(mint_race), rpc=rpc_race)
+
+    mint_structural = str(Keypair().pubkey())
+    rpc_structural = _ScriptedBuyRpc(
+        Pubkey.from_string(mint_structural), TOKEN_2022_PROGRAM_ID, _BUY_STRUCTURAL_ERROR
+    )
+    await _run_one_candidate(settings, ledger, state, make_candidate(mint_structural), rpc=rpc_structural)
+    ledger.close()
+
+    assert (mint_race, "sim_would_fail_race") in calls
+    assert (mint_structural, "sim_would_fail_structural") in calls
+    rows = list(read_events(tmp_path))
+    skip_reasons = {r["mint"]: r["reason"] for r in rows if r.get("event") == "CandidateSkipped"}
+    assert skip_reasons[mint_race] == "sim_would_fail_race"
+    assert skip_reasons[mint_structural] == "sim_would_fail_structural"
+
+
+@pytest.mark.asyncio
+async def test_three_consecutive_buy_race_errors_do_not_halt_entries(tmp_path):
+    settings = load_test_settings()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    state = TradingState()
+
+    for _ in range(3):
+        mint = str(Keypair().pubkey())
+        rpc = _ScriptedBuyRpc(Pubkey.from_string(mint), TOKEN_2022_PROGRAM_ID, _BUY_RACE_ERROR)
+        await _run_one_candidate(settings, ledger, state, make_candidate(mint), rpc=rpc)
+
+    ledger.close()
+    assert state._consecutive_failures == 0
+    assert state.entries_halted is False
