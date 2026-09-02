@@ -27,6 +27,7 @@ import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -346,6 +347,55 @@ def trailing_exit_stats(real_events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def filter_since(events: Iterable[dict[str, Any]], since: str | None) -> list[dict[str, Any]]:
+    """Filters to events at/after 00:00 UTC on `since` (YYYY-MM-DD). None
+    passes everything through unfiltered. The ledger rotates daily and
+    read_events reads an entire directory, so without this a report over a
+    later window stays permanently polluted by an earlier window's rows
+    (MEASUREMENT-RUN-HANDOFF.md Section 4, Phase 0 item 4)."""
+    events = list(events)
+    if since is None:
+        return events
+    cutoff_ts = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC).timestamp()
+    return [e for e in events if e.get("ts_wall", 0) >= cutoff_ts]
+
+
+def dry_run_exit_reason_counts(events: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """Exit-reason COUNTS from dry-run TradeClosed rows only -- deliberately
+    separate from exit_reason_breakdown/ClosedRealTrade (MEASUREMENT-RUN-
+    HANDOFF.md Section 3.1: dry-run and real statistics never mix). No PnL
+    here: a dry-run PnL was never realized, so there is nothing to average."""
+    counts: Counter[str] = Counter()
+    for row in events:
+        if row.get("event") != "TradeClosed" or not row.get("dry_run"):
+            continue
+        exit_reasons = row.get("exit_reasons") or []
+        reason = exit_reasons[-1] if exit_reasons else "unknown"
+        counts[reason] += 1
+    return dict(counts)
+
+
+def dry_run_observation(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """What a dry run CAN legitimately show: it exercises the same
+    websocket -> filter -> simulate path as a real run, minus only the
+    send, so entry count/latency and simulated exit shape are real
+    observations about that path -- just not about realized PnL, slippage,
+    fill rate, or fee drag, none of which exist without a real send."""
+    events = list(events)
+    entry_count = sum(1 for e in events if e.get("event") == "EntryFilled" and e.get("dry_run"))
+    closed_count = sum(1 for e in events if e.get("event") == "TradeClosed" and e.get("dry_run"))
+    latencies = [
+        e["latency_seconds"] for e in events if e.get("event") == "EntryFilled" and e.get("dry_run")
+    ]
+    return {
+        "entry_count": entry_count,
+        "closed_count": closed_count,
+        "latency_pcts": latency_percentiles(latencies),
+        "latency_n": len(latencies),
+        "exit_reason_counts": dry_run_exit_reason_counts(events),
+    }
+
+
 # --- printing --------------------------------------------------------------
 
 
@@ -358,14 +408,44 @@ def _fmt_lamports(n: float | None) -> str:
 def print_report(all_events: list[dict[str, Any]]) -> None:
     real_events = [e for e in all_events if not e.get("dry_run")]
     closed_trades = load_closed_real_trades(all_events)
+    dry_run_count = sum(1 for e in all_events if e.get("dry_run"))
+    real_count = len(all_events) - dry_run_count
 
-    print("=== Trade status ===")
+    if dry_run_count:
+        print(
+            f"NOTE: this ledger contains {dry_run_count} dry-run event(s) and "
+            f"{real_count} real event(s). Sections differ in which population "
+            "they count -- see each heading. A dry-run event never reaches a "
+            "real-trade statistic (MEASUREMENT-RUN-HANDOFF.md Section 3.1)."
+        )
+        print()
+
+    print("=== Trade status (ALL events, incl. dry-run) ===")
     statuses = trade_status_counts(all_events)
     total = sum(statuses.values())
     orphan_rate = statuses["ORPHANED"] / total if total else 0.0
     for status in ("CLOSED", "OPEN", "ORPHANED"):
         print(f"  {status}: {statuses.get(status, 0)}")
     print(f"  orphan_rate: {orphan_rate:.1%} (n={total})")
+
+    if dry_run_count:
+        print()
+        print("=== Dry-run observation (SIMULATED fills only -- no order was ever sent) ===")
+        obs = dry_run_observation(all_events)
+        print(f"  dry-run entries: {obs['entry_count']}  dry-run closed: {obs['closed_count']}")
+        if obs["latency_pcts"] is None:
+            print(f"  entry latency: n/a (n={obs['latency_n']})")
+        else:
+            p50, p90, p_max = obs["latency_pcts"]
+            print(
+                f"  entry latency: p50={p50:.3f}s p90={p90:.3f}s max={p_max:.3f}s "
+                f"(n={obs['latency_n']})"
+            )
+        if not obs["exit_reason_counts"]:
+            print("  exit-reason breakdown (SIMULATED): n/a (n=0)")
+        else:
+            for reason, count in sorted(obs["exit_reason_counts"].items(), key=lambda kv: -kv[1]):
+                print(f"  exit-reason (SIMULATED) {reason}: n={count}")
 
     print()
     print("=== Win rate & PnL (CLOSED real trades only) ===")
@@ -386,7 +466,7 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
             )
 
     print()
-    print("=== Fee drag ===")
+    print("=== Fee drag (CLOSED real trades only) ===")
     drag, n = fee_drag(closed_trades)
     if drag is None:
         print(f"  fee_drag: n/a (n={n})")
@@ -394,7 +474,7 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
         print(f"  fee_drag: {drag:.2%} of gross turnover (n={n} trades)")
 
     print()
-    print("=== Entry latency (real fills) ===")
+    print("=== Entry latency (REAL fills only) ===")
     latencies = [
         e["latency_seconds"] for e in real_events if e.get("event") == "EntryFilled"
     ]
@@ -415,7 +495,7 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
             print(f"  {reason}: n={count} mean_pnl={_fmt_lamports(mean_pnl)}")
 
     print()
-    print("=== Funnel (one CandidateSeen denominator) ===")
+    print("=== Funnel (ALL events, incl. dry-run; one CandidateSeen denominator) ===")
     funnel = compute_funnel(all_events)
     seen = funnel["seen"]
     print(f"  seen: {seen}")
@@ -429,7 +509,7 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
         print(f"    filled: {funnel['filled']} ({funnel['filled'] / seen:.1%})")
 
     print()
-    print("=== Tier-2 outcome: fill rate & forward return ===")
+    print("=== Tier-2 outcome: fill rate & forward return (ALL events, incl. dry-run) ===")
     tier2_report = tier2_outcome_report(all_events)
     if not tier2_report:
         print("  n/a -- no Tier2Evaluated rows in this ledger")
@@ -462,7 +542,7 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
         print(f"  fee_drag including rent recovery: {drag_in_str} (n={n})")
 
     print()
-    print("=== Sizing readiness ===")
+    print("=== Sizing readiness (CLOSED real trades only) ===")
     settings = load_settings()
     position_sol = settings.config.trading.position_sol
     baseline_position_sol = settings.config.trading.baseline_position_sol
@@ -488,7 +568,7 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
         )
 
     print()
-    print("=== Exit mechanism (MILESTONE-4-HANDOFF.md) ===")
+    print("=== Exit mechanism (CLOSED real trades only) ===")
     exit_breakdown = exit_reason_breakdown(closed_trades)
     trailing_stats = trailing_exit_stats(real_events)
     if trailing_stats["n"] == 0:
@@ -516,7 +596,7 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
         )
 
     print()
-    print("=== Adverse selection: median forward return by arm ===")
+    print("=== Adverse selection: median forward return by arm (ALL events, incl. dry-run) ===")
     by_arm = adverse_selection_by_arm(all_events)
     if not by_arm:
         print("  n/a -- no ShadowPrice rows in this ledger (shadow.enabled: false?)")
@@ -535,6 +615,13 @@ def main() -> None:
         "--ledger", type=str, default=None,
         help="Path to the ledger base file or directory (default: config.yaml's ledger.path)",
     )
+    parser.add_argument(
+        "--since", type=str, default=None,
+        help="Only include events at/after 00:00 UTC on this date (YYYY-MM-DD). "
+        "The ledger rotates daily and this script reads the whole directory, so "
+        "use this to isolate one window (e.g. a live run) from an earlier one "
+        "(e.g. a dry-run measurement window).",
+    )
     args = parser.parse_args()
 
     if args.ledger is not None:
@@ -544,9 +631,10 @@ def main() -> None:
         ledger_path = PROJECT_ROOT / settings.config.ledger.path
 
     directory = ledger_path if ledger_path.is_dir() else ledger_path.parent
-    events = list(read_events(directory))
+    events = filter_since(read_events(directory), args.since)
     if not events:
-        print(f"No ledger events found under {directory}")
+        since_note = f" since {args.since}" if args.since else ""
+        print(f"No ledger events found under {directory}{since_note}")
         return
 
     print_report(events)
