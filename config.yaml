@@ -44,11 +44,16 @@ fees:
   # Reserved per open position so a pending ATA close is never left unpayable.
   close_fee_reserve_sol: 0.0003
   # Explicit compute-unit limit for every transaction (buy, sell, ATA
-  # close) -- free, and tighter scheduling than the default
-  # 200,000-CU-per-instruction assumption. Pump.fun's buy/sell instructions
-  # are simple account writes; 40,000 CU is generous headroom measured
-  # against similar Anchor program calls, not a hard on-chain requirement.
-  compute_unit_limit: 40000
+  # close) -- free (raising it costs nothing while priority_fee_sol is 0.0;
+  # see submit.py's fee formula), and tighter scheduling than the default
+  # 200,000-CU-per-instruction assumption. The original 40,000 estimate was
+  # never verified against a live simulateTransaction and was wrong -- the
+  # MEASUREMENT-RUN-HANDOFF.md Phase 1 window failed every single real buy
+  # with InstructionError Custom "ComputationalBudgetExceeded" and halted
+  # entries via the failsafe within a minute. Re-measured live: 60,000 is
+  # the exact floor that clears it for pump.fun's real buy instruction
+  # (create-ATA + buy, Token-2022 CPI); 100,000 keeps ~40% margin.
+  compute_unit_limit: 100000
   # The priority fee actually paid, in SOL, per transaction. 0.0 is
   # DELIBERATE -- this project has explicitly dropped the latency race
   # (see the PRD's Out of Scope section), so paying for faster inclusion
@@ -168,10 +173,9 @@ ledger:
   enabled: true
 
 shadow:
-  # Off by default: polling costs real RPC budget even at a low
-  # sample_fraction, and it's meant to be switched on deliberately after
-  # observing credit burn under normal trading, not silently by default.
-  enabled: false
+  # Switched on for the MEASUREMENT-RUN-HANDOFF.md Phase 1 observation
+  # window (deliberately, per its own reasoning below -- not silently).
+  enabled: true
   # Ignored for the "bought" arm, which is always sampled at 1.0 -- it's
   # small (bounded by trade count) and sampling it would destroy the
   # adverse-selection comparison it exists to enable. Applies to

@@ -5,7 +5,7 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 
-from pumpbot.config import ExecutionConfig, FeesConfig
+from pumpbot.config import ExecutionConfig, FeesConfig, Settings
 from pumpbot.submit import (
     BASE_FEE_LAMPORTS_PER_SIGNATURE,
     BlockhashExpiredError,
@@ -341,3 +341,16 @@ def test_estimate_entry_fee_lamports_adds_priority_fee_per_signature():
     priority_fee_lamports = round(0.0005 * 1_000_000_000)
     expected = BASE_FEE_LAMPORTS_PER_SIGNATURE + priority_fee_lamports
     assert estimate_entry_fee_lamports(fees_config, signature_count=1) == expected
+
+
+def test_config_yaml_compute_unit_limit_clears_the_live_measured_floor():
+    # MEASUREMENT-RUN-HANDOFF.md Phase 1 (2026-09-01): the original 40,000
+    # guess failed EVERY real buy simulation with InstructionError Custom
+    # "ComputationalBudgetExceeded" and halted entries via the failsafe
+    # within a minute of live traffic. Re-measured live against a real
+    # pump.fun buy (create-ATA + buy, Token-2022 CPI): 60,000 is the exact
+    # floor that clears it. This guards against a future edit silently
+    # reintroducing a value at or below that floor without live
+    # verification against a real simulateTransaction.
+    settings = Settings.load()
+    assert settings.config.fees.compute_unit_limit >= 60_000
