@@ -58,11 +58,35 @@ fees:
   priority_fee_sol: 0.0
 
 exits:
+  # Deferred: whether 1.5x/2.5x/-35% are the right SHAPE is an open question
+  # (see .claude/plans/DEFERRED-exit-threshold-retune.md) but n=1 real closed
+  # trades means retuning now would be fitting noise, not data. Unchanged by
+  # Milestone 4 -- note Task 1 changed what these numbers MEASURE (realizable
+  # proceeds, not spot), which makes them effectively slightly tighter on the
+  # upside and slightly looser on the downside than before.
   take_profit_1_multiple: 1.5
   take_profit_1_fraction: 0.5
   take_profit_2_multiple: 2.5
   stop_loss_fraction: -0.35
   timeout_seconds: 300
+  # Behavior-aware exits (MILESTONE-4-HANDOFF.md). Both peer-proven, both
+  # default on, both individually switchable.
+  trailing_enabled: true
+  # A trailing stop live from entry is just a tighter stop-loss and fires on
+  # ordinary entry noise -- it only arms once realizable proceeds reach this
+  # multiple of cost basis. Deliberately below take_profit_1_multiple (1.5)
+  # so a run that stalls just short of the first rung is still protected.
+  trailing_arm_multiple: 1.3
+  # Once armed, fires when realizable proceeds fall back this fraction of the
+  # gain from the peak multiple -- i.e. give back a quarter of peak value
+  # before bailing. Wide enough not to fire on the normal volatility of a
+  # minutes-old token.
+  trailing_drawdown_fraction: 0.25
+  # Highest-priority exit in the ladder: the creator moving tokens is
+  # information about why the price is about to move, and unlike a price
+  # threshold, it doesn't recover. See main.py's monitor loop for the
+  # baseline/decrease detection and its unknown-is-never-a-sell-signal rule.
+  creator_sell_enabled: true
 
 filters:
   tier1:

@@ -63,6 +63,18 @@ class ExitsConfig(BaseModel):
     take_profit_2_multiple: float
     stop_loss_fraction: float
     timeout_seconds: int
+    # Behavior-aware exits (MILESTONE-4-HANDOFF.md). Both default True and
+    # are individually switchable so a single misbehaving mechanism can be
+    # turned off without reverting the milestone.
+    trailing_enabled: bool
+    # Below take_profit_1_multiple: protects a run that stalls short of the
+    # first rung, which is the gap this mechanism exists to close.
+    trailing_arm_multiple: float
+    # Of the gain from peak (i.e. give back this fraction of peak value
+    # before bailing) -- wide enough not to fire on ordinary volatility of a
+    # minutes-old token.
+    trailing_drawdown_fraction: float
+    creator_sell_enabled: bool
 
 
 class Tier1FilterConfig(BaseModel):

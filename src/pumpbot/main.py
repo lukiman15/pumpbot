@@ -49,7 +49,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import Transaction
 from spl.token.instructions import create_idempotent_associated_token_account
 
-from pumpbot.ata_close import close_ata_after_exit
+from pumpbot.ata_close import close_ata_after_exit, get_token_account_balance_raw
 from pumpbot.config import PROJECT_ROOT, FeesConfig, Settings, load_settings
 from pumpbot.curve import (
     LAMPORTS_PER_SOL,
@@ -92,6 +92,7 @@ from pumpbot.persistence import load_state, save_state
 from pumpbot.positions import Position, PositionLimitReachedError, PositionManager
 from pumpbot.program import (
     TOKEN_2022_PROGRAM_ID,
+    derive_associated_token_address,
     derive_bonding_curve_pda,
     derive_bonding_curve_v2_pda,
     pick_buyback_fee_recipient,
@@ -154,6 +155,14 @@ class TradingState:
         self._trade_legs: dict[str, list[_LegRecord]] = {}
         self._trade_entry_wall: dict[str, float] = {}
         self._trade_exit_reasons: dict[str, list[str]] = {}
+        # Creator-sell detection (MILESTONE-4-HANDOFF.md Section 4.3): the
+        # creator's ATA balance observed once, at the first successful poll
+        # for that mint. A mint whose baseline turned out to be zero (no ATA,
+        # or an already-empty one -- there is no signal to be had) is added
+        # to _creator_ata_poll_done so the monitor loop stops spending an RPC
+        # call on it every tick.
+        self._creator_ata_baseline: dict[str, int] = {}
+        self._creator_ata_poll_done: set[str] = set()
 
     def record_failure(self, limit: int) -> None:
         self._consecutive_failures += 1
@@ -197,6 +206,21 @@ class TradingState:
 
     def all_token_programs(self) -> dict[str, str]:
         return dict(self._token_programs)
+
+    def creator_ata_baseline_for(self, mint: str) -> int | None:
+        return self._creator_ata_baseline.get(mint)
+
+    def set_creator_ata_baseline(self, mint: str, balance: int) -> None:
+        self._creator_ata_baseline[mint] = balance
+        if balance == 0:
+            self._creator_ata_poll_done.add(mint)
+
+    def creator_ata_poll_done(self, mint: str) -> bool:
+        return mint in self._creator_ata_poll_done
+
+    def forget_creator_ata(self, mint: str) -> None:
+        self._creator_ata_baseline.pop(mint, None)
+        self._creator_ata_poll_done.discard(mint)
 
     def open_trade(self, mint: str) -> str:
         """Mints a fresh trade_id for a buy that just confirmed. Call
@@ -839,15 +863,86 @@ async def run_position_monitor(
                 logger.exception("failed to refresh curve state for mint=%s", position.mint)
                 continue
 
-            current_price_sol = (
+            # curve_price_sol below stays the marginal spot price -- same
+            # meaning it had before Milestone 4, kept for continuity in the
+            # ledger. The exit DECISION itself uses realizable proceeds
+            # (what tokens_remaining would actually net right now, fee and
+            # price impact deducted) instead -- see MILESTONE-4-HANDOFF.md
+            # Section 3.1: spot price quietly biases every rung, firing
+            # take-profits early and the stop-loss late.
+            curve_price_sol = (
                 spot_price_sol_per_token(curve) * 10**TOKEN_DECIMALS / LAMPORTS_PER_SOL
             )
-            decision = position.evaluate_exit(current_price_sol, time.monotonic(), exits_cfg)
-            if decision is None:
+            tokens_remaining_raw = round(position.tokens_remaining * 10**TOKEN_DECIMALS)
+            try:
+                realizable_sol_lamports = (
+                    tokens_to_sol(curve, tokens_remaining_raw)
+                    if tokens_remaining_raw > 0
+                    else 0
+                )
+            except CurveCompleteError:
+                logger.warning(
+                    "bonding curve completed/migrated for open position mint=%s -- "
+                    "cannot price exits this tick",
+                    position.mint,
+                )
                 continue
+            realizable_sol_value = realizable_sol_lamports / LAMPORTS_PER_SOL
 
             creator = state.creator_for(position.mint)
             known_token_program = state.token_program_for(position.mint)
+
+            # Creator-sell detection (Section 4.3): baseline the creator's
+            # ATA balance on first successful observation, then watch for a
+            # decrease. Absent ATA is a valid zero baseline, not an error --
+            # record it and stop polling, there's no signal to be had. A
+            # failed fetch leaves creator_sold False and must NEVER touch
+            # the failsafe counter (Section 3.5/4.3): this is a monitoring
+            # call, not an execution failure, and treating "unknown" as
+            # "sold" would exit every position on the first RPC blip.
+            creator_sold = False
+            if (
+                exits_cfg.creator_sell_enabled
+                and creator is not None
+                and known_token_program is not None
+                and not state.creator_ata_poll_done(position.mint)
+            ):
+                try:
+                    creator_ata = derive_associated_token_address(
+                        Pubkey.from_string(creator), mint, Pubkey.from_string(known_token_program)
+                    )
+                    creator_balance = await get_token_account_balance_raw(rpc, creator_ata)
+                except Exception:
+                    logger.warning(
+                        "creator ATA balance fetch failed mint=%s -- treating as "
+                        "unknown, not a sell signal",
+                        position.mint,
+                        exc_info=True,
+                    )
+                else:
+                    if creator_balance is None:
+                        creator_balance = 0
+                    baseline = state.creator_ata_baseline_for(position.mint)
+                    if baseline is None:
+                        state.set_creator_ata_baseline(position.mint, creator_balance)
+                    elif creator_balance < baseline:
+                        creator_sold = True
+
+            decision = position.evaluate_exit(
+                realizable_sol_value, time.monotonic(), exits_cfg, creator_sold=creator_sold
+            )
+            if decision is None:
+                continue
+
+            # Captured before apply_exit() reduces tokens_remaining below --
+            # this is the multiple the decision was actually made on.
+            decision_realizable_multiple = (
+                realizable_sol_value / position.cost_basis_of_remaining_sol
+                if position.cost_basis_of_remaining_sol > 0
+                else 0.0
+            )
+            decision_peak_multiple = position.trailing_peak_multiple
+
             tokens_to_sell_raw = round(
                 position.tokens_remaining * decision.fraction * 10**TOKEN_DECIMALS
             )
@@ -953,7 +1048,9 @@ async def run_position_monitor(
                     exit_reason=decision.reason.value,
                     tokens_sold=tokens_sold,
                     tokens_remaining=position.tokens_remaining,
-                    curve_price_sol=current_price_sol,
+                    curve_price_sol=curve_price_sol,
+                    realizable_multiple=decision_realizable_multiple,
+                    peak_multiple=decision_peak_multiple,
                     settlement=sell_settlement.to_dict() if sell_settlement is not None else None,
                 )
             )
@@ -980,6 +1077,7 @@ async def run_position_monitor(
                             )
                         )
                 position_manager.close(position.mint)
+                state.forget_creator_ata(position.mint)
                 popped = state.pop_trade(position.mint)
                 if popped is not None:
                     _, legs, exit_reasons, entry_wall = popped

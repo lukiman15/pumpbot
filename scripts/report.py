@@ -325,6 +325,27 @@ def fee_composition(trades: list[ClosedRealTrade]) -> dict[str, Any]:
     }
 
 
+def trailing_exit_stats(real_events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Mean peak multiple vs mean realized multiple for trailing-stop exits
+    -- the gap between them is the giveback, and it's the number that says
+    whether exits.trailing_drawdown_fraction is set sanely. Pulled from
+    ExitFilled rows directly (not ClosedRealTrade/TradeClosed) since
+    peak_multiple/realizable_multiple are per-leg fields, not per-trade
+    ones -- see ledger.py's ExitFilled docstring."""
+    rows = [
+        e for e in real_events
+        if e.get("event") == "ExitFilled" and e.get("exit_reason") == "trailing_stop"
+    ]
+    n = len(rows)
+    if n == 0:
+        return {"n": 0}
+    return {
+        "n": n,
+        "mean_peak_multiple": statistics.mean(r["peak_multiple"] for r in rows),
+        "mean_realized_multiple": statistics.mean(r["realizable_multiple"] for r in rows),
+    }
+
+
 # --- printing --------------------------------------------------------------
 
 
@@ -464,6 +485,34 @@ def print_report(all_events: list[dict[str, Any]]) -> None:
             f"  position_sol={position_sol:.4f} exceeds baseline -- "
             f"NOT DATA-SUPPORTED ({real_closed}<{threshold} real closed trades, "
             "expectancy at this size is unmeasured)"
+        )
+
+    print()
+    print("=== Exit mechanism (MILESTONE-4-HANDOFF.md) ===")
+    exit_breakdown = exit_reason_breakdown(closed_trades)
+    trailing_stats = trailing_exit_stats(real_events)
+    if trailing_stats["n"] == 0:
+        print("  trailing_stop giveback: n/a (n=0)")
+    else:
+        peak = trailing_stats["mean_peak_multiple"]
+        realized = trailing_stats["mean_realized_multiple"]
+        print(
+            f"  trailing_stop: mean_peak_multiple={peak:.3f}x "
+            f"mean_realized_multiple={realized:.3f}x giveback={peak - realized:.3f}x "
+            f"(n={trailing_stats['n']})"
+        )
+
+    creator_sold_entry = exit_breakdown.get("creator_sold")
+    if creator_sold_entry is None:
+        print("  creator_sold: n/a (n=0)")
+    else:
+        cs_count, cs_mean_pnl = creator_sold_entry
+        all_mean_pnl = (
+            statistics.mean(t.realized_pnl_lamports for t in closed_trades) if closed_trades else None
+        )
+        print(
+            f"  creator_sold: n={cs_count} mean_pnl={_fmt_lamports(cs_mean_pnl)} "
+            f"vs all-trades mean_pnl={_fmt_lamports(all_mean_pnl)}"
         )
 
     print()

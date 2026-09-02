@@ -1,11 +1,20 @@
 import asyncio
+import base64
 import contextlib
+import struct
+import time
 
 import pytest
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
 
 from pumpbot.config import FeesConfig, Settings
-from pumpbot.curve import BondingCurveState
+from pumpbot.curve import (
+    LAMPORTS_PER_SOL,
+    TOKEN_DECIMALS,
+    BondingCurveState,
+    sol_to_tokens,
+)
 from pumpbot.filters.tier1 import Candidate
 from pumpbot.heartbeat import Heartbeat
 from pumpbot.ledger import Ledger, read_events
@@ -14,10 +23,15 @@ from pumpbot.main import (
     _build_buy,
     _build_sell,
     count_real_closed_trades,
+    run_position_monitor,
     run_trader,
 )
-from pumpbot.positions import PositionManager
-from pumpbot.program import TOKEN_2022_PROGRAM_ID
+from pumpbot.positions import Position, PositionManager
+from pumpbot.program import (
+    TOKEN_2022_PROGRAM_ID,
+    derive_associated_token_address,
+    derive_bonding_curve_pda,
+)
 from pumpbot.shadow import ShadowTracker
 
 TEST_KEYPAIR = Keypair()
@@ -197,6 +211,386 @@ def test_build_buy_prepends_compute_budget_before_create_ata_and_buy():
     # [SetComputeUnitLimit, SetComputeUnitPrice, create-ATA, buy] once a
     # nonzero priority fee is configured.
     assert len(instructions_with_priority) == 4
+
+
+# --- Milestone 4: behavior-aware exits (run_position_monitor) ---
+
+
+def load_monitor_settings(**exits_overrides) -> Settings:
+    settings = Settings.load()
+    exits = settings.config.exits.model_copy(update=exits_overrides)
+    settings.config = settings.config.model_copy(update={"exits": exits})
+    return settings
+
+
+def make_curve(
+    virtual_sol_reserves: int = 30_000_000_000,
+    virtual_token_reserves: int = 1_073_000_000_000_000,
+    real_token_reserves: int = 793_100_000_000_000,
+    real_sol_reserves: int = 0,
+) -> BondingCurveState:
+    return BondingCurveState(
+        virtual_token_reserves=virtual_token_reserves,
+        virtual_sol_reserves=virtual_sol_reserves,
+        real_token_reserves=real_token_reserves,
+        real_sol_reserves=real_sol_reserves,
+        token_total_supply=1_000_000_000_000_000,
+        complete=False,
+    )
+
+
+def encode_curve_base64(curve: BondingCurveState) -> str:
+    raw = struct.pack(
+        "<8s5QB",
+        b"\x00" * 8,
+        curve.virtual_token_reserves,
+        curve.virtual_sol_reserves,
+        curve.real_token_reserves,
+        curve.real_sol_reserves,
+        curve.token_total_supply,
+        int(curve.complete),
+    )
+    return base64.b64encode(raw).decode()
+
+
+def open_test_position(
+    position_manager: PositionManager,
+    state: TradingState,
+    mint: str,
+    creator: str,
+    curve: BondingCurveState,
+    position_sol_lamports: int = 1_000_000,
+) -> Position:
+    """Mirrors main.py's real entry-price computation exactly (all-in
+    execution price, buy fee and impact baked in) so a test curve held flat
+    from entry produces a realizable multiple near 1.0, not exactly 1.0 --
+    close enough to sit well clear of every exit threshold by default."""
+    tokens_out_raw = sol_to_tokens(curve, position_sol_lamports)
+    tokens_out_whole = tokens_out_raw / 10**TOKEN_DECIMALS
+    entry_price_sol = (position_sol_lamports / LAMPORTS_PER_SOL) / tokens_out_whole
+    position = Position(
+        mint=mint, entry_price_sol=entry_price_sol, entry_tokens=tokens_out_whole, opened_at=time.monotonic()
+    )
+    position_manager.open(position)
+    state.remember_creator(mint, creator)
+    state.remember_token_program(mint, str(TOKEN_2022_PROGRAM_ID))
+    return position
+
+
+class _ScriptedMonitorRpc:
+    """Dispatches getAccountInfo by address (bonding curve vs creator ATA
+    need different answers) rather than by method name alone -- test_ata_close.py's
+    _FakeRpc can't express that. `on_creator_fetch`, if set, is called
+    instead of returning `creator_balance_raw`/`creator_ata_exists`, to
+    simulate a monitoring RPC failure."""
+
+    def __init__(
+        self,
+        bonding_curve_pda: Pubkey,
+        curve: BondingCurveState,
+        creator_ata: Pubkey | None = None,
+        creator_ata_exists: bool = True,
+        creator_balance_raw: int = 1000,
+        on_creator_fetch=None,
+    ) -> None:
+        self._bonding_curve_pda = str(bonding_curve_pda)
+        self._curve_b64 = encode_curve_base64(curve)
+        self._creator_ata = str(creator_ata) if creator_ata is not None else None
+        self._creator_ata_exists = creator_ata_exists
+        self._creator_balance_raw = creator_balance_raw
+        self._on_creator_fetch = on_creator_fetch
+        self.calls: list[tuple[str, list]] = []
+
+    async def call(self, method, params=None, pool="trading"):
+        self.calls.append((method, params or []))
+        address = params[0] if params else None
+
+        if method == "getAccountInfo" and address == self._bonding_curve_pda:
+            return {"value": {"data": [self._curve_b64, "base64"]}}
+
+        if method == "getAccountInfo" and address == self._creator_ata:
+            if self._on_creator_fetch is not None:
+                self._on_creator_fetch()
+            if not self._creator_ata_exists:
+                return {"value": None}
+            return {"value": {"data": ["", "base64"]}}
+
+        if method == "getTokenAccountBalance" and address == self._creator_ata:
+            return {"value": {"amount": str(self._creator_balance_raw)}}
+
+        if method == "simulateTransaction":
+            return {"value": {"err": None}}
+
+        raise AssertionError(f"unexpected rpc call: {method} {params}")
+
+    def creator_ata_call_count(self) -> int:
+        return sum(
+            1
+            for method, params in self.calls
+            if method == "getAccountInfo" and params and params[0] == self._creator_ata
+        )
+
+
+async def _run_monitor_for(
+    settings: Settings, rpc, position_manager: PositionManager, state: TradingState, ledger: Ledger,
+    real_seconds: float = 0.05,
+) -> None:
+    """Runs run_position_monitor with its sleep interval collapsed to ~0
+    (patched via settings is not possible -- POSITION_MONITOR_INTERVAL_SECONDS
+    is a module constant -- so this monkeypatches it directly) for
+    `real_seconds` of wall-clock time, giving it several loop iterations,
+    then cancels. There is no task_done signal to await, mirroring
+    _run_one_candidate's approach for run_trader."""
+    import pumpbot.main as main_module
+
+    original_interval = main_module.POSITION_MONITOR_INTERVAL_SECONDS
+    main_module.POSITION_MONITOR_INTERVAL_SECONDS = 0.0
+    heartbeat = Heartbeat(settings.config.heartbeat)
+    task = asyncio.create_task(
+        run_position_monitor(
+            settings, rpc, TEST_KEYPAIR, TEST_KEYPAIR.pubkey(), position_manager, heartbeat, state, ledger
+        )
+    )
+    try:
+        await asyncio.sleep(real_seconds)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        main_module.POSITION_MONITOR_INTERVAL_SECONDS = original_interval
+
+
+@pytest.mark.asyncio
+async def test_creator_ata_polling_uses_default_pool_not_shadow(tmp_path):
+    settings = load_monitor_settings(creator_sell_enabled=True, trailing_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    creator_ata = derive_associated_token_address(CREATOR, MINT, TOKEN_2022_PROGRAM_ID)
+    rpc = _ScriptedMonitorRpc(bonding_curve_pda, curve, creator_ata=creator_ata, creator_ata_exists=True)
+
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    await _run_monitor_for(settings, rpc, manager, state, ledger)
+    ledger.close()
+
+    # Every getAccountInfo/getTokenAccountBalance call above went through
+    # rpc.call() with the default pool= ("trading"), never pool="shadow" --
+    # asserted by construction, since _ScriptedMonitorRpc.call would reject
+    # an unexpected signature. Positive check: at least one creator-ATA
+    # call happened, proving the polling path actually ran.
+    assert rpc.creator_ata_call_count() >= 1
+
+
+@pytest.mark.asyncio
+async def test_creator_ata_fetch_failure_leaves_position_open_and_does_not_touch_failsafe(tmp_path):
+    settings = load_monitor_settings(creator_sell_enabled=True, trailing_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    creator_ata = derive_associated_token_address(CREATOR, MINT, TOKEN_2022_PROGRAM_ID)
+
+    def blow_up():
+        raise RuntimeError("simulated RPC hiccup")
+
+    rpc = _ScriptedMonitorRpc(
+        bonding_curve_pda, curve, creator_ata=creator_ata, on_creator_fetch=blow_up
+    )
+
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    await _run_monitor_for(settings, rpc, manager, state, ledger)
+    ledger.close()
+
+    # A monitoring-call failure is not an execution failure (Section 3.5) --
+    # this mirrors the Milestone 3 test proving the fee gate doesn't trip
+    # the failsafe counter either.
+    assert state._consecutive_failures == 0
+    assert state.entries_halted is False
+    assert manager.get(str(MINT)) is not None  # position still open
+    rows = list(read_events(tmp_path))
+    assert not any(r.get("exit_reason") == "creator_sold" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_missing_creator_ata_establishes_zero_baseline_and_never_fires(tmp_path):
+    settings = load_monitor_settings(creator_sell_enabled=True, trailing_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    creator_ata = derive_associated_token_address(CREATOR, MINT, TOKEN_2022_PROGRAM_ID)
+    rpc = _ScriptedMonitorRpc(bonding_curve_pda, curve, creator_ata=creator_ata, creator_ata_exists=False)
+
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    await _run_monitor_for(settings, rpc, manager, state, ledger)
+    ledger.close()
+
+    assert state.creator_ata_baseline_for(str(MINT)) == 0
+    # A zero baseline can never decrease -- polling stops once established.
+    assert state.creator_ata_poll_done(str(MINT)) is True
+    assert rpc.creator_ata_call_count() == 1
+    rows = list(read_events(tmp_path))
+    assert not any(r.get("exit_reason") == "creator_sold" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_creator_balance_decrease_fires_creator_sold_exit(tmp_path):
+    settings = load_monitor_settings(creator_sell_enabled=True, trailing_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    creator_ata = derive_associated_token_address(CREATOR, MINT, TOKEN_2022_PROGRAM_ID)
+
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    # First tick establishes a baseline of 1000; a decrease has nothing to
+    # compare against a baseline set in the SAME rpc instance across two
+    # runs, so drive this with a mutable balance via two scripted rpcs
+    # sharing the same TradingState (baseline persists on state, not rpc).
+    rpc1 = _ScriptedMonitorRpc(
+        bonding_curve_pda, curve, creator_ata=creator_ata, creator_ata_exists=True, creator_balance_raw=1000
+    )
+    await _run_monitor_for(settings, rpc1, manager, state, ledger)
+    assert state.creator_ata_baseline_for(str(MINT)) == 1000
+
+    rpc2 = _ScriptedMonitorRpc(
+        bonding_curve_pda, curve, creator_ata=creator_ata, creator_ata_exists=True, creator_balance_raw=400
+    )
+    await _run_monitor_for(settings, rpc2, manager, state, ledger)
+    ledger.close()
+
+    rows = list(read_events(tmp_path))
+    exit_rows = [r for r in rows if r.get("event") == "ExitFilled"]
+    assert len(exit_rows) == 1
+    assert exit_rows[0]["exit_reason"] == "creator_sold"
+    assert manager.get(str(MINT)) is None  # fully exited, position closed
+
+
+@pytest.mark.asyncio
+async def test_creator_balance_increase_does_not_fire(tmp_path):
+    settings = load_monitor_settings(creator_sell_enabled=True, trailing_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    creator_ata = derive_associated_token_address(CREATOR, MINT, TOKEN_2022_PROGRAM_ID)
+
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    rpc1 = _ScriptedMonitorRpc(
+        bonding_curve_pda, curve, creator_ata=creator_ata, creator_ata_exists=True, creator_balance_raw=1000
+    )
+    await _run_monitor_for(settings, rpc1, manager, state, ledger)
+    assert state.creator_ata_baseline_for(str(MINT)) == 1000
+
+    rpc2 = _ScriptedMonitorRpc(
+        bonding_curve_pda, curve, creator_ata=creator_ata, creator_ata_exists=True, creator_balance_raw=1500
+    )
+    await _run_monitor_for(settings, rpc2, manager, state, ledger)
+    ledger.close()
+
+    assert manager.get(str(MINT)) is not None  # still open, never exited
+
+
+@pytest.mark.asyncio
+async def test_creator_is_none_is_handled_by_continuing_not_exiting(tmp_path):
+    settings = load_monitor_settings(creator_sell_enabled=True, trailing_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()  # no remember_creator call -- creator stays None
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    tokens_out_raw = sol_to_tokens(curve, 1_000_000)
+    tokens_out_whole = tokens_out_raw / 10**TOKEN_DECIMALS
+    entry_price_sol = (1_000_000 / LAMPORTS_PER_SOL) / tokens_out_whole
+    position = Position(
+        mint=str(MINT), entry_price_sol=entry_price_sol, entry_tokens=tokens_out_whole, opened_at=time.monotonic()
+    )
+    manager.open(position)
+    # No creator_ata registered at all -- _ScriptedMonitorRpc would reject
+    # any getAccountInfo call for one, proving none was attempted.
+    rpc = _ScriptedMonitorRpc(bonding_curve_pda, curve)
+
+    await _run_monitor_for(settings, rpc, manager, state, ledger)
+    ledger.close()
+
+    assert state._consecutive_failures == 0
+    assert state.entries_halted is False
+    rows = list(read_events(tmp_path))
+    assert not any(r.get("event") == "ExitFilled" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_creator_sold_outranks_trailing_stop_in_the_ladder(tmp_path):
+    settings = load_monitor_settings(creator_sell_enabled=True, trailing_enabled=True)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    creator_ata = derive_associated_token_address(CREATOR, MINT, TOKEN_2022_PROGRAM_ID)
+
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    rpc1 = _ScriptedMonitorRpc(
+        bonding_curve_pda, curve, creator_ata=creator_ata, creator_ata_exists=True, creator_balance_raw=1000
+    )
+    await _run_monitor_for(settings, rpc1, manager, state, ledger)  # baseline
+
+    rpc2 = _ScriptedMonitorRpc(
+        bonding_curve_pda, curve, creator_ata=creator_ata, creator_ata_exists=True, creator_balance_raw=1
+    )
+    await _run_monitor_for(settings, rpc2, manager, state, ledger)
+    ledger.close()
+
+    rows = list(read_events(tmp_path))
+    exit_rows = [r for r in rows if r.get("event") == "ExitFilled"]
+    assert len(exit_rows) == 1
+    assert exit_rows[0]["exit_reason"] == "creator_sold"
+
+
+@pytest.mark.asyncio
+async def test_creator_sell_disabled_never_polls_or_fires(tmp_path):
+    settings = load_monitor_settings(creator_sell_enabled=False, trailing_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+    # No creator_ata registered at all -- the scripted rpc would reject any
+    # getAccountInfo call for one, proving the switch actually disables
+    # polling rather than just ignoring what it finds.
+    rpc = _ScriptedMonitorRpc(bonding_curve_pda, curve)
+
+    await _run_monitor_for(settings, rpc, manager, state, ledger)
+    ledger.close()
+
+    assert manager.get(str(MINT)) is not None
+    rows = list(read_events(tmp_path))
+    assert not any(r.get("event") == "ExitFilled" for r in rows)
+
+
+def test_creator_sell_enabled_defaults_true_in_config_yaml():
+    settings = Settings.load()
+    assert settings.config.exits.creator_sell_enabled is True
+
+
+def test_trailing_enabled_defaults_true_in_config_yaml():
+    settings = Settings.load()
+    assert settings.config.exits.trailing_enabled is True
 
 
 def test_build_sell_prepends_compute_budget_before_sell():

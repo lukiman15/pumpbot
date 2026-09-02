@@ -1,3 +1,4 @@
+import json
 import time
 
 from pumpbot.persistence import load_state, save_state
@@ -70,6 +71,52 @@ def test_save_with_no_open_positions_writes_empty_list(tmp_path):
     assert positions == []
     assert creators == {}
     assert token_programs == {}
+
+
+def test_save_and_load_round_trip_preserves_trailing_peak_and_armed(tmp_path):
+    path = tmp_path / "positions.json"
+    manager = PositionManager(max_concurrent_positions=1)
+    position = make_position("MintAAA")
+    position.trailing_peak_multiple = 1.8
+    position.trailing_armed = True
+    manager.open(position)
+
+    save_state(path, manager, creators={}, token_programs={})
+    positions, _, _ = load_state(path)
+
+    restored = positions[0]
+    assert restored.trailing_peak_multiple == 1.8
+    assert restored.trailing_armed is True
+
+
+def test_load_state_tolerates_pre_milestone_4_file_missing_trailing_keys(tmp_path):
+    # A state file written before Milestone 4 has no trailing_peak_multiple
+    # or trailing_armed keys at all -- the first restart after deploying
+    # this milestone must not raise KeyError with a real position open.
+    path = tmp_path / "positions.json"
+    path.write_text(
+        json.dumps(
+            {
+                "positions": [
+                    {
+                        "mint": "MintAAA",
+                        "entry_price_sol": 0.0001,
+                        "entry_tokens": 1000.0,
+                        "tokens_remaining": 1000.0,
+                        "take_profit_1_hit": False,
+                        "opened_at_wall": time.time(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    positions, _, _ = load_state(path)
+
+    restored = positions[0]
+    assert restored.trailing_peak_multiple == 0.0
+    assert restored.trailing_armed is False
 
 
 def test_closed_position_disappears_from_next_save(tmp_path):

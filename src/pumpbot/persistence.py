@@ -40,6 +40,8 @@ def save_state(
             "entry_tokens": position.entry_tokens,
             "tokens_remaining": position.tokens_remaining,
             "take_profit_1_hit": position.take_profit_1_hit,
+            "trailing_peak_multiple": position.trailing_peak_multiple,
+            "trailing_armed": position.trailing_armed,
             "opened_at_wall": now_wall - (now_monotonic - position.opened_at),
             "creator": creators.get(position.mint),
             "token_program_id": token_programs.get(position.mint),
@@ -74,6 +76,14 @@ def load_state(path: Path) -> tuple[list[Position], dict[str, str], dict[str, st
         )
         position.tokens_remaining = row["tokens_remaining"]
         position.take_profit_1_hit = row["take_profit_1_hit"]
+        # .get() with fallbacks -- a state file written before Milestone 4
+        # lacks these keys entirely. Peak defaults to 0.0 rather than
+        # guessing a value: the very next evaluate_exit() call sets it to
+        # the real current multiple regardless (multiple > 0.0 always holds
+        # for a live position), and armed=False means trailing can't
+        # falsely fire before that first live tick re-establishes it.
+        position.trailing_peak_multiple = row.get("trailing_peak_multiple", 0.0)
+        position.trailing_armed = row.get("trailing_armed", False)
         positions.append(position)
         if row.get("creator"):
             creators[row["mint"]] = row["creator"]

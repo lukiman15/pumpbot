@@ -23,6 +23,8 @@ class ExitReason(str, Enum):
     TAKE_PROFIT_2 = "take_profit_2"
     STOP_LOSS = "stop_loss"
     TIMEOUT = "timeout"
+    TRAILING_STOP = "trailing_stop"
+    CREATOR_SOLD = "creator_sold"
 
 
 class PositionLimitReachedError(RuntimeError):
@@ -47,23 +49,66 @@ class Position:
     opened_at: float  # time.monotonic() at open
     tokens_remaining: float = field(init=False)
     take_profit_1_hit: bool = field(default=False, init=False)
+    # Gross SOL originally paid (entry_price_sol already includes the buy fee
+    # and its price impact -- see main.py's entry_price_sol computation).
+    # Stored once rather than recomputed as entry_price_sol * entry_tokens in
+    # three places.
+    entry_cost_sol: float = field(init=False)
+    # High-water mark for the trailing-drawdown exit (Task 2), expressed as a
+    # MULTIPLE of cost basis, not an absolute SOL figure -- absolute proceeds
+    # shrink when a partial take-profit-1 fill reduces tokens_remaining, which
+    # would otherwise corrupt the peak on the very next tick after that fill.
+    trailing_peak_multiple: float = field(default=0.0, init=False)
+    trailing_armed: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self.tokens_remaining = self.entry_tokens
+        self.entry_cost_sol = self.entry_price_sol * self.entry_tokens
+
+    @property
+    def cost_basis_of_remaining_sol(self) -> float:
+        """Gross SOL basis attributable to tokens_remaining -- entry_cost_sol
+        scaled down proportionally as partial exits reduce the position."""
+        if self.entry_tokens <= 0:
+            return 0.0
+        return self.entry_cost_sol * (self.tokens_remaining / self.entry_tokens)
 
     def evaluate_exit(
-        self, current_price_sol: float, now: float, config: ExitsConfig
+        self,
+        realizable_sol_value: float,
+        now: float,
+        config: ExitsConfig,
+        *,
+        creator_sold: bool = False,
     ) -> ExitDecision | None:
-        """Returns the highest-priority exit action due right now, or None."""
+        """Returns the highest-priority exit action due right now, or None.
+
+        `realizable_sol_value` is what selling tokens_remaining would actually
+        net right now (fee and price impact already deducted -- see
+        curve.py's tokens_to_sol), NOT the marginal spot price. Comparing
+        realizable proceeds against cost basis is what makes `multiple` mean
+        "what would I actually get back per SOL I actually put in" (see
+        MILESTONE-4-HANDOFF.md Section 4.1).
+        """
         if self.tokens_remaining <= 0:
             return None
 
-        multiple = (
-            current_price_sol / self.entry_price_sol if self.entry_price_sol > 0 else 0.0
-        )
+        cost_basis = self.cost_basis_of_remaining_sol
+        multiple = realizable_sol_value / cost_basis if cost_basis > 0 else 0.0
         pnl_fraction = multiple - 1.0
 
-        # Stop loss first: capital preservation beats letting a ladder play out.
+        if config.trailing_enabled:
+            self.trailing_peak_multiple = max(self.trailing_peak_multiple, multiple)
+            if not self.trailing_armed and multiple >= config.trailing_arm_multiple:
+                self.trailing_armed = True
+
+        # Ladder order (MILESTONE-4-HANDOFF.md Section 4.4): creator sold
+        # outranks everything -- it's information about *why* the price is
+        # about to move, and unlike a threshold on price, it doesn't recover.
+        if creator_sold:
+            return ExitDecision(ExitReason.CREATOR_SOLD, fraction=1.0)
+
+        # Stop loss next: capital preservation beats letting a ladder play out.
         if pnl_fraction <= config.stop_loss_fraction:
             return ExitDecision(ExitReason.STOP_LOSS, fraction=1.0)
 
@@ -72,6 +117,16 @@ class Position:
         # waiting -- check the higher rung first regardless of tp1 status.
         if multiple >= config.take_profit_2_multiple:
             return ExitDecision(ExitReason.TAKE_PROFIT_2, fraction=1.0)
+
+        # Trailing sits below tp2 (a spike past the cap should take the cap,
+        # not the trailed price) and above tp1 (a run that rolls over should
+        # exit fully rather than take a half-profit on the way down).
+        if (
+            config.trailing_enabled
+            and self.trailing_armed
+            and multiple <= self.trailing_peak_multiple * (1 - config.trailing_drawdown_fraction)
+        ):
+            return ExitDecision(ExitReason.TRAILING_STOP, fraction=1.0)
 
         if not self.take_profit_1_hit and multiple >= config.take_profit_1_multiple:
             return ExitDecision(

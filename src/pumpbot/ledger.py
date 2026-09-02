@@ -116,7 +116,13 @@ class ExitFilled(_EventMixin):
     exit_reason: str
     tokens_sold: float
     tokens_remaining: float
-    curve_price_sol: float
+    curve_price_sol: float  # spot, pre-fee -- unchanged meaning from Milestone 2
+    # Realizable proceeds / cost basis at decision time (Milestone 4 Task 1)
+    # and the trailing high-water mark at that same moment (Task 2) -- what
+    # curve_price_sol alone can't reconstruct: a trailing exit you can't
+    # later distinguish from a lucky one isn't evidence.
+    realizable_multiple: float
+    peak_multiple: float
     settlement: dict[str, Any] | None
 
 
