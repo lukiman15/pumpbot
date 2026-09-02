@@ -824,6 +824,27 @@ async def run_trader(
         heartbeat.record_trade()
 
 
+# Anchor error code 3012 == AccountNotInitialized. Confirmed live during
+# MEASUREMENT-RUN-HANDOFF.md's Phase 1 dry run: a dry-run buy never sends,
+# so the wallet's ATA for that mint was never actually created on-chain,
+# and every dry-run sell simulation for it hits this deterministically. It
+# carries zero information about whether a real sell would succeed (see
+# _simulate_sell's docstring) -- once DRY_RUN=false and buys land for real,
+# this can't occur, since the ATA genuinely exists by the time an exit is
+# evaluated.
+_DRY_RUN_OWNERSHIP_ERROR_MARKERS = ("'Custom': 3012",)
+
+
+def _is_dry_run_ownership_error(error: str) -> bool:
+    """Allowlist, not denylist (MEASUREMENT-RUN-HANDOFF.md 3.6): an error
+    string this doesn't recognize is treated as a real "shape" defect
+    (wrong account ordering, bad encoding, a rejected slippage floor,
+    missing bonding_curve_v2) -- never silently swallowed as ownership
+    noise, since that would suppress a real bug rather than the deadlock
+    it replaces."""
+    return any(marker in error for marker in _DRY_RUN_OWNERSHIP_ERROR_MARKERS)
+
+
 async def run_position_monitor(
     settings: Settings,
     rpc: RpcClient,
@@ -978,13 +999,41 @@ async def run_position_monitor(
                     error = f"sell simulation crashed: {exc}"
 
             if error is not None:
-                logger.warning(
-                    "simulated sell would fail mint=%s reason=%s decision=%s -- "
-                    "leaving position open",
-                    position.mint, error, decision.reason.value,
-                )
-                state.record_failure(failure_limit)
-                continue
+                if dry_run and _is_dry_run_ownership_error(error):
+                    # Structurally guaranteed by DRY_RUN, not a defect --
+                    # proceed with the exit as if the simulation had
+                    # passed, same trust level the dry-run buy path already
+                    # gives a passing simulation. Falls through below
+                    # (no `continue`); record_failure is never called.
+                    logger.debug(
+                        "dry-run sell simulation hit an ownership-class "
+                        "error (expected under DRY_RUN) mint=%s reason=%s "
+                        "decision=%s -- proceeding with the exit anyway",
+                        position.mint, error, decision.reason.value,
+                    )
+                elif dry_run:
+                    # Unrecognized or shape-class (wrong account ordering,
+                    # bad encoding, a rejected slippage floor) -- a real
+                    # defect that must stay loud. Never calls
+                    # record_failure in dry run either: the failsafe exists
+                    # to stop real money bleeding through a broken send
+                    # path, and dry run has no send path.
+                    logger.critical(
+                        "dry-run sell simulation failed with an "
+                        "unrecognized or shape-class error -- this is a "
+                        "real defect, not DRY_RUN noise: mint=%s reason=%s "
+                        "decision=%s -- leaving position open",
+                        position.mint, error, decision.reason.value,
+                    )
+                    continue
+                else:
+                    logger.warning(
+                        "simulated sell would fail mint=%s reason=%s decision=%s -- "
+                        "leaving position open",
+                        position.mint, error, decision.reason.value,
+                    )
+                    state.record_failure(failure_limit)
+                    continue
 
             signature: str | None = None
             if not dry_run:

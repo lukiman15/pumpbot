@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import logging
 import struct
 import time
 
@@ -292,6 +293,7 @@ class _ScriptedMonitorRpc:
         creator_ata_exists: bool = True,
         creator_balance_raw: int = 1000,
         on_creator_fetch=None,
+        sell_error: dict | None = None,
     ) -> None:
         self._bonding_curve_pda = str(bonding_curve_pda)
         self._curve_b64 = encode_curve_base64(curve)
@@ -299,6 +301,7 @@ class _ScriptedMonitorRpc:
         self._creator_ata_exists = creator_ata_exists
         self._creator_balance_raw = creator_balance_raw
         self._on_creator_fetch = on_creator_fetch
+        self._sell_error = sell_error
         self.calls: list[tuple[str, list]] = []
 
     async def call(self, method, params=None, pool="trading"):
@@ -319,7 +322,7 @@ class _ScriptedMonitorRpc:
             return {"value": {"amount": str(self._creator_balance_raw)}}
 
         if method == "simulateTransaction":
-            return {"value": {"err": None}}
+            return {"value": {"err": self._sell_error}}
 
         raise AssertionError(f"unexpected rpc call: {method} {params}")
 
@@ -618,3 +621,135 @@ def test_build_sell_prepends_compute_budget_before_sell():
     # [SetComputeUnitLimit, SetComputeUnitPrice, sell] once a nonzero
     # priority fee is configured.
     assert len(instructions_with_priority) == 3
+
+
+# --- MEASUREMENT-RUN-HANDOFF.md Task 0: dry-run sell-simulation classification ---
+
+# Anchor's AccountNotInitialized, confirmed live during Phase 1 -- see
+# main.py's _DRY_RUN_OWNERSHIP_ERROR_MARKERS. Every dry-run sell hits this
+# because a dry-run buy never really sends, so the wallet's ATA never
+# really exists on-chain.
+_OWNERSHIP_ERROR = {"InstructionError": [1, {"Custom": 3012}]}
+# An arbitrary different Custom code -- stands in for a real shape defect
+# (wrong account ordering, bad encoding, a rejected slippage floor).
+_SHAPE_ERROR = {"InstructionError": [1, {"Custom": 6074}]}
+
+
+@pytest.mark.asyncio
+async def test_dry_run_ownership_error_closes_position_normally(tmp_path):
+    settings = load_monitor_settings(timeout_seconds=0, trailing_enabled=False, creator_sell_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    rpc = _ScriptedMonitorRpc(bonding_curve_pda, curve, sell_error=_OWNERSHIP_ERROR)
+    await _run_monitor_for(settings, rpc, manager, state, ledger)
+    ledger.close()
+
+    rows = list(read_events(tmp_path))
+    exit_rows = [r for r in rows if r.get("event") == "ExitFilled"]
+    assert len(exit_rows) == 1
+    assert exit_rows[0]["exit_reason"] == "timeout"
+    assert any(r.get("event") == "TradeClosed" for r in rows)
+    assert manager.get(str(MINT)) is None
+    assert state._consecutive_failures == 0
+    assert state.entries_halted is False
+
+
+@pytest.mark.asyncio
+async def test_dry_run_ownership_error_never_touches_failsafe_across_repeats(tmp_path):
+    settings = load_monitor_settings(timeout_seconds=0, trailing_enabled=False, creator_sell_enabled=False)
+    curve = make_curve()
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+
+    for _ in range(3):
+        mint = str(Keypair().pubkey())
+        open_test_position(manager, state, mint, str(CREATOR), curve)
+        bonding_curve_pda = derive_bonding_curve_pda(Pubkey.from_string(mint))
+        rpc = _ScriptedMonitorRpc(bonding_curve_pda, curve, sell_error=_OWNERSHIP_ERROR)
+        await _run_monitor_for(settings, rpc, manager, state, ledger)
+        assert manager.get(mint) is None
+
+    ledger.close()
+    assert state._consecutive_failures == 0
+    assert state.entries_halted is False
+
+
+@pytest.mark.asyncio
+async def test_dry_run_shape_class_error_leaves_position_open_and_logs_critical(tmp_path, caplog):
+    settings = load_monitor_settings(timeout_seconds=0, trailing_enabled=False, creator_sell_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    rpc = _ScriptedMonitorRpc(bonding_curve_pda, curve, sell_error=_SHAPE_ERROR)
+    with caplog.at_level(logging.CRITICAL, logger="pumpbot.main"):
+        await _run_monitor_for(settings, rpc, manager, state, ledger)
+    ledger.close()
+
+    assert manager.get(str(MINT)) is not None
+    assert state._consecutive_failures == 0
+    assert state.entries_halted is False
+    assert any(record.levelno == logging.CRITICAL for record in caplog.records)
+    rows = list(read_events(tmp_path))
+    assert not any(r.get("event") == "ExitFilled" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_unrecognized_error_takes_shape_branch_not_ownership(tmp_path):
+    settings = load_monitor_settings(timeout_seconds=0, trailing_enabled=False, creator_sell_enabled=False)
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=True)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    # An allowlist (not denylist, per MEASUREMENT-RUN-HANDOFF.md 3.6) must
+    # treat anything it doesn't recognize as a real defect, not ownership
+    # noise -- so this must NOT be silently proceeded past.
+    rpc = _ScriptedMonitorRpc(bonding_curve_pda, curve, sell_error={"SomeTotallyUnrelatedError": True})
+    await _run_monitor_for(settings, rpc, manager, state, ledger)
+    ledger.close()
+
+    assert manager.get(str(MINT)) is not None
+    assert state._consecutive_failures == 0
+    assert state.entries_halted is False
+    rows = list(read_events(tmp_path))
+    assert not any(r.get("event") == "ExitFilled" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_live_mode_sell_simulation_failure_still_records_failure(tmp_path):
+    """Regression guard on MEASUREMENT-RUN-HANDOFF.md 3.6's 'live path
+    completely unchanged': the exact same error code that dry run proceeds
+    past is a real, unresolved execution failure once DRY_RUN=false --
+    there is no send path in dry run, but there is one here, and simulation
+    failing means a real send was never attempted."""
+    settings = load_monitor_settings(timeout_seconds=0, trailing_enabled=False, creator_sell_enabled=False)
+    settings.secrets = settings.secrets.model_copy(update={"dry_run": False})
+    curve = make_curve()
+    bonding_curve_pda = derive_bonding_curve_pda(MINT)
+    manager = PositionManager(max_concurrent_positions=1)
+    state = TradingState()
+    ledger = Ledger(tmp_path / "ledger.jsonl", run_id="test-run", dry_run=False)
+    open_test_position(manager, state, str(MINT), str(CREATOR), curve)
+
+    rpc = _ScriptedMonitorRpc(bonding_curve_pda, curve, sell_error=_OWNERSHIP_ERROR)
+    await _run_monitor_for(settings, rpc, manager, state, ledger)
+    ledger.close()
+
+    assert manager.get(str(MINT)) is not None
+    # >=1 rather than ==1: the position stays open every tick (unlike the
+    # dry-run tests above, which close on the first tick), so several
+    # monitor ticks fire within the test window -- the point is that the
+    # live path still calls record_failure at all, unlike dry run.
+    assert state._consecutive_failures >= 1
