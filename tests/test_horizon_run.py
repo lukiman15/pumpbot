@@ -77,9 +77,15 @@ def test_completion_percentiles_reproduce_section_2_3_on_real_ledger_data():
     from pumpbot.config import PROJECT_ROOT as ROOT
     from pumpbot.config import load_settings
 
+    # Pinned to the original 300s/15s-poll run's run_id, not "whatever is
+    # currently in the ledger directory" -- the extended-horizon run (Task 3
+    # of HORIZON-RUN-HANDOFF.md) appends its own 707 mints under a different
+    # run_id to the same ledger files, and this test exists to reproduce
+    # Section 2.3's frozen table, not to track the live ledger's growth.
     settings = load_settings()
     ledger_dir = (ROOT / settings.config.ledger.path).parent
-    events = list(read_events(ledger_dir))
+    old_run_id = "82aa36e044dd4e2daa8955bd8a693e8d"
+    events = [e for e in read_events(ledger_dir) if e.get("run_id") == old_run_id]
     mints, diagnostics = horizon_run.load_horizon_mints(events)
 
     assert diagnostics["usable_mints"] == 578
